@@ -16,7 +16,7 @@
 #   - No password changes
 #   - No external file hosting
 
-set -euo pipefail
+set +e
 
 TARGET="13.13.1.112"
 PROXY_HOST="127.0.0.1"
@@ -135,8 +135,7 @@ fi
 if ! $HTTPS_UP && ! $HTTP_UP; then
     log ""
     log "BOTH HTTP AND HTTPS ARE DOWN. Target unreachable."
-    log "Will retry in next check-in."
-    exit 1
+    log "Continuing with limited recon (port/service probing only)..."
 fi
 
 ###############################################################################
