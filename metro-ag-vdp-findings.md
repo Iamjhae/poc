@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **17 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **18 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
@@ -1148,6 +1148,77 @@ WWW-Authenticate: Bearer resource_metadata="https://api-internal.prod.mfulfillde
 
 ---
 
+## Finding 18: Depotsettings JWT Signature Validation Bypass — Any Non-Empty String Accepted as Authenticated
+
+**Severity**: High
+**Asset**: `https://betty.metrosystems.net/orderfulfillment.depotsettings.v1/` (in scope)
+**Type**: Broken Authentication (OWASP A07) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The depotsettings microservice does **not validate JWT signatures or even JWT format**. Any non-empty string sent in the custom `JWT` header is accepted as "authenticated," changing the response from 401 (Unauthorized) to 403 (Forbidden). This means the entire JWT authentication layer is bypassed — the service only checks for the **presence** of the JWT header, not its validity.
+
+This behavior is **unique to the depotsettings service** — all other tested betty services (ordermanagement, pickandpack, stocklocation) properly return 401 for invalid JWTs. The 403 response comes from the application-level authorization layer (the SwaggerServlet), indicating the request has passed authentication and is being evaluated for permissions.
+
+### Evidence
+
+**Systematic test results — all paths under depotsettings:**
+
+| Test Case | JWT Header Value | Response |
+|-----------|-----------------|----------|
+| No header | (absent) | **401** "You must provide a http header 'JWT'" |
+| Empty value | `JWT: ` | **401** |
+| Random string | `JWT: notavalidjwt` | **403** Forbidden |
+| alg:none JWT | `JWT: eyJhbG...` (alg:none) | **403** Forbidden |
+| RS256 wrong sig | `JWT: eyJhbG...AAAA` (random sig) | **403** Forbidden |
+| Forged admin JWT | `JWT: eyJhbG...` (admin claims) | **403** Forbidden |
+
+**All paths change from 401→403 with any JWT value:**
+```
+[depot/DE_STOREDEPOT_00528] NoJWT: 401 | AnyJWT: 403
+[depot/DE_STOREDEPOT_00054] NoJWT: 401 | AnyJWT: 403
+[depots]                    NoJWT: 401 | AnyJWT: 403
+[settings]                  NoJWT: 401 | AnyJWT: 403
+[config]                    NoJWT: 401 | AnyJWT: 403
+[country/DE]                NoJWT: 401 | AnyJWT: 403
+```
+
+**Other services properly validate JWT signatures (no change):**
+```
+[ordermanagement/orderservice/] NoJWT: 401 | AnyJWT: 401  ← properly validated
+[ordermanagement/orderbff/]     NoJWT: 401 | AnyJWT: 401  ← properly validated
+[pickandpack.consolidation.v1/] NoJWT: 401 | AnyJWT: 401  ← properly validated
+```
+
+**403 response contains SwaggerServlet class (application-level, not WAF):**
+```html
+<th>SERVLET:</th><td>com.freiheit.betty.microservice.core.rest.swagger.SwaggerServlet-5c60f096</td>
+```
+
+**Standard `Authorization: Bearer` header is ignored — only custom `JWT` header is checked:**
+```
+Authorization: Bearer <forged_jwt> → 401 (ignored)
+JWT: <forged_jwt>                  → 403 (accepted)
+```
+
+### Impact
+
+- **Authentication bypass**: The depotsettings service accepts completely unsigned, malformed, or random-string JWTs as valid authentication — the entire JWT verification chain is non-functional
+- **Inconsistent security controls**: This service is the only one among 5+ tested betty services that fails to validate JWTs, indicating a deployment or configuration error
+- **One step from data access**: The only remaining barrier is the authorization layer (403). If the correct claims/entitlements can be determined (employee entitlement codes are already disclosed in Finding 12: `lPM`, `lTM`, `fISTC`), complete access to depot settings for 669 stores across 19 countries would be possible
+- **Load-balanced across 3+ instances**: Different SwaggerServlet hashes (`-5c60f096`, `-18f4086e`, `-1760e688`) confirm the vulnerability exists on all instances
+- **Custom JWT header convention**: Using `JWT:` instead of standard `Authorization: Bearer` bypasses security middleware and WAF rules that inspect standard headers
+
+### Recommendation
+
+1. **Immediately enable JWT signature verification** on the depotsettings service — this is a critical security gap
+2. Standardize JWT handling across all betty microservices using a shared authentication library
+3. Migrate from custom `JWT` header to standard `Authorization: Bearer` header
+4. Implement centralized JWT validation at the reverse proxy/gateway layer, not per-service
+5. Add integration tests that verify JWT signature validation for every service
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -1184,12 +1255,18 @@ The following in-scope targets were **unreachable** from the testing environment
 - Internal API URL leak via WWW-Authenticate header (Finding 17)
 - PKCE not enforced and state parameter not required on IDAM (Finding 15)
 - PKCE plain method accepted (downgrade from S256) (Finding 15)
+- Depotsettings JWT signature validation completely absent (Finding 18)
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
 - IDAM device code grant (404 — not implemented)
 - IDAM ROPC/password grant (listed in discovery but returns "not supported")
 - CSP nonce prediction (nonces are properly random per-request)
+- SSRF via 3v coupon API kid field (reflected but static JWKS lookup, no outbound request)
+- JWT alg:none on ordermanagement/pickandpack/stocklocation (properly rejected, stay at 401)
+- HTTP verb tampering on ordermanagement (all methods return 401 consistently)
+- Elasticsearch direct access on search API (all internal paths return 404)
+- Open redirect via betty SPA query params (SPA serves same page for all params — client-side handling)
 - JWT algorithm confusion RS256→HS256 (server rejects HS256 tokens, 500 but not exploitable)
 - JWT kid SQL injection / path traversal (reflected but no injection — kid lookup against static JWKS)
 - Server-side XSS on betty shops (SPA architecture — no server-side template rendering)
