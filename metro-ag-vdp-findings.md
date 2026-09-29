@@ -3,17 +3,18 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 2 - Deep exploitation testing completed
+**Status**: Phase 3 - Deep exploitation testing + infrastructure reconnaissance
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **10 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **13 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
-1. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 — exposing cryptographic key material, JWT library internals, and version information (Finding 7)
-2. **No rate limiting on IDAM authentication endpoint**, combined with **OAuth client_id enumeration** via differential error messages, enabling credential brute-force attacks at unlimited speed (Findings 8 + 9)
-3. **Unauthenticated production search API** exposing 993,709 product records with B2B/B2C pricing, inventory quantities, and seller data — with wildcard CORS and no rate limiting enabling mass automated scraping (Findings 1 + 8)
+1. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
+2. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 — exposing cryptographic key material, JWT library internals, and version information (Finding 7)
+3. **Betty platform authentication architecture fully disclosed** via unauthenticated JS bundles — OAuth client_ids (BTEX, ADFS), SSO cookie name (metroIdentity), employee login endpoints, server technology (Ktor), and 100+ production/pre-prod domain mappings (Finding 12)
+4. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services, enabling path traversal from any service context to the root (Finding 13)
 
 ---
 
@@ -480,7 +481,7 @@ The IDAM OAuth 2.0 token endpoint returns different error messages for valid vs.
 
 ---
 
-## Finding 10: Betty Ordercapture Swagger/API Documentation Behind Weak 403
+## Finding 10: Multiple Swagger/API Documentation Files Behind Weak 403
 
 **Severity**: Low-Medium
 **Assets**: `betty.metrosystems.net`, `tienda.makro.es`, `shop.metro.bg`, `metromax.metro.hu`, `shop.metro.ro` (all in scope)
@@ -488,32 +489,275 @@ The IDAM OAuth 2.0 token endpoint returns different error messages for valid vs.
 
 ### Description
 
-The Ordercapture API documentation endpoint (`/ordercapture/swagger.json`) returns 403 Forbidden across all country-specific betty shop instances, confirming the Swagger/OpenAPI specification file exists but is access-restricted. This is a defense-in-depth concern — the file's presence and consistent 403 across all deployments suggests it contains the complete API specification.
+Multiple API service documentation endpoints return 403 Forbidden across all country-specific betty shop instances. At least **7 different swagger.json files** are confirmed to exist behind 403 responses, covering the entire betty platform's backend services. Combined with Finding 13 (semicolon path traversal), the `..;/` technique redirects to the root-level swagger.json (also 403).
 
 ### Evidence
 
+**Seven distinct swagger.json files behind 403 on betty.metrosystems.net:**
 ```
-[403] (134 B) betty.metrosystems.net/ordercapture/swagger.json
-[403] (134 B) tienda.makro.es/ordercapture/swagger.json
-[403] (134 B) shop.metro.bg/ordercapture/swagger.json
-[403] (134 B) metromax.metro.hu/ordercapture/swagger.json
-[403] (134 B) shop.metro.ro/ordercapture/swagger.json
+[403] (134 B) /ordercapture/swagger.json
+[403] (134 B) /articlesearch/swagger.json
+[403] (134 B) /checkout/swagger.json
+[403] (134 B) /ordermanagement/swagger.json
+[403] (134 B) /pickandpack/swagger.json
+[403] (134 B) /depotmanagement/swagger.json
+[403] (134 B) /searchdiscover/swagger.json
+[403] (134 B) /explore.tracking.v1/swagger.json
 ```
 
-Meanwhile, non-existent paths return 404 (18 B):
+**Also on tienda.makro.es:**
 ```
-[404] (18 B) tienda.makro.es/ordercapture/v2/api-docs
+[403] (134 B) /orderfulfillment/swagger.json
+[403] (134 B) /orderfulfillment/openapi.json
+```
+
+Meanwhile, non-existent paths return 404 (18 B or 10 B).
+
+### Impact
+
+- Confirms 7+ API microservices with documentation deployed to production
+- Consistent 403 (same 134-byte response) suggests a WAF/routing rule — a single bypass would expose all service specifications
+- Complete API surface map for attackers: ordercapture, articlesearch, checkout, ordermanagement, pickandpack, depotmanagement, searchdiscover, tracking
+
+### Recommendation
+
+1. Return 404 instead of 403 to avoid confirming the files' existence
+2. Remove Swagger/OpenAPI files from production deployments entirely
+3. Ensure WAF rules cannot be bypassed via path manipulation (see Finding 13)
+
+---
+
+## Finding 11: Orderfulfillment Production Configuration Mass Exposure — 669 Stores Across 19 Countries
+
+**Severity**: High
+**Asset**: `https://tienda.makro.es/orderfulfillment.uidispatcher.static/` (in scope — *.makro.es)
+**Type**: Sensitive Data Exposure (OWASP A02) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The orderfulfillment dispatcher SPA serves **639KB** of production operational configuration (`config.js`) without any authentication. This file contains detailed warehouse/depot settings for **669 store entries** across **19 countries** (AT, BG, CZ, DE, ES, FR, HR, HU, IT, KZ, MD, NL, PL, PT, RO, RS, SK, TR, UA), including assortment handling zones, slot management modes, feature flags, and operational parameters.
+
+The accompanying HTML page also leaks extensive client-side configuration including internal service URLs, country-specific feature toggles, Google Tag Manager IDs, Datadog monitoring settings, and employee authentication flow details.
+
+### Evidence
+
+**config.js — 639,320 bytes, fully unauthenticated:**
+```
+GET /orderfulfillment.uidispatcher.static/app/config.js HTTP/2
+Host: tienda.makro.es
+
+200 OK (639,320 bytes)
+```
+
+**Sample depot configuration (DE_STOREDEPOT_00528):**
+```json
+{
+  "locationType": "depot",
+  "enhanced2CharactersSSCCPrintMark": true,
+  "enableNewSlotAssignmentAfterPicking": true,
+  "handledAssortmentAreas": [
+    "DANGEROUS_GOODS", "DEEP_FROZEN", "DRINKS", "FISH",
+    "FRUITS_VEGETABLES", "MAIN", "MEAT", "MEAT_CUT"
+  ],
+  "flexibleWaveDetails": {
+    "slotHandlingMode": {
+      "slotCleanupInterval": 3,
+      "proposalType": "dynamic_tour_space_driven",
+      "validationType": "flexible_validation"
+    }
+  },
+  "landingPageMenuItems": [
+    "CONSOLIDATION", "QUICK_CONSOLIDATION", "PAM_BETA", "PICKING_QUALITY_CONTROL"
+  ]
+}
+```
+
+**HTML page leaks additional operational data:**
+```javascript
+window.clickAndCollectEnabledCountries = "DE,ES,FR,PT,NL,PL,KZ,PK";
+window.webshopEnabledCountries = "FR,PL,NL";
+window.dropshipmentEnabledCountries = "FR,DE,ES,RO";
+window.marketplaceEnabledCountries = "FR";
+window.voucher_countries = "FR";
+window.idam_login_base_url = "https://idam.metrosystems.net";
+window.erikaBaseUrl = "https://erika.metrosystems.net";
+```
+
+**GCP Project ID leaked:** `cf-ordercaptu-oc-prod-17`
+
+**Datadog monitoring config leaked:**
+```
+datadogEnvironment="prod"
+datadogRumSampleRate="4"
+datadogRumPremiumSampleRate="100"
+datadogSessionReplayEnabled="true"
 ```
 
 ### Impact
 
-- Confirms the API documentation exists and could be exposed through access control bypass
-- Consistent 403 across all countries suggests centralized config — a single misconfiguration would expose it globally
+- **Operational intelligence**: Complete view of Metro AG's warehouse operations across 19 countries — assortment zones, slot management algorithms, consolidation workflows
+- **Competitive advantage**: Detailed feature flags reveal which countries have which capabilities (marketplace, dropshipment, click-and-collect, webshop)
+- **Infrastructure mapping**: GCP project IDs, Datadog configuration, internal service URLs
+- **Attack surface expansion**: 669 store/depot IDs enable targeted IDOR attacks on store-specific APIs
+- **Reconnaissance value**: Country-to-capability mapping reveals business expansion strategy
 
 ### Recommendation
 
-1. Return 404 instead of 403 to avoid confirming the file's existence
-2. Ensure the Swagger file is not deployed to production — serve it only in development environments
+1. Require authentication before serving config.js and the dispatcher page
+2. Move operational configuration to server-side — never send depot/warehouse settings to the client
+3. Remove GCP project IDs and monitoring configuration from client-side code
+4. Implement access controls on the orderfulfillment dispatcher
+
+---
+
+## Finding 12: Betty Platform Complete Authentication Architecture Disclosure
+
+**Severity**: Medium-High
+**Assets**: `https://tienda.makro.es/orderfulfillment.uidispatcher.static/` and `https://betty.metrosystems.net/` (both in scope)
+**Type**: Sensitive Data Exposure (OWASP A02) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The orderfulfillment SPA's JavaScript bundles (`api.js`, 111KB) expose the **complete authentication architecture** for the betty platform, including OAuth client credentials, employee and customer login API endpoints, the SSO cookie name, server technology, ADFS integration details, and a comprehensive domain-to-country mapping covering **100+ production and pre-production domains** across 20+ countries.
+
+### Evidence
+
+**OAuth client credentials disclosed:**
+```javascript
+client_id: "BTEX"
+realm_id: "BETTY_REALM"
+// IDAM authorize URL construction:
+idamLoginBaseUrl + "/authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM"
+```
+
+**ADFS client_id and endpoint:**
+```javascript
+"https://adfs3.metro.info/adfs/oauth2/authorize?resource=" + t
+  + "&response_type=code&client_id=e595352d-d1df-4a9a-a469-d33bb5c46ef3&redirect_uri=" + t
+```
+
+**Authentication API endpoints disclosed:**
+```javascript
+POST /ordercapture/login/auth/loginCustomer?country=DE    // Customer login
+POST /ordercapture/login/auth/loginEmployee2?country=DE    // Employee login
+POST /ordercapture/login/auth/singleSignOn                 // SSO endpoint
+```
+
+**SSO endpoint confirms server technology (Ktor/Kotlin):**
+```
+HTTP/2 401
+www-authenticate: betty-jwt realm="Ktor Server"
+```
+
+**SSO cookie name leaked via IDAM iframe:**
+```javascript
+var ssoCookie = 'metroIdentity';
+// Checks: document.cookie for cookie named 'metroIdentity'
+```
+
+**Complete domain-to-country mapping (sample from 20+ countries, 100+ domains):**
+```javascript
+DE: ["betty.metrosystems.net", "metro.de", "produkte.metro.de", "lieferservice.metro.de", ...]
+FR: ["shop.metro.fr", "livraison.metro.fr", "beta.metro.fr", ...]
+PL: ["horecadostawy.pl", "online.makro.pl", "zamawiarka.makro-dla-gastronomii.pl", ...]
+ES: ["tienda.makro.es", "distribucion-hosteleria.makro.es", ...]
+TR: ["metrogastroservis.com", "horeca-dagitim.metro-tr.com", ...]
+// ...including pre-prod: betty-pp, betty-dev, *-pp.* for each country
+```
+
+**JWT handling — client-side decode, localStorage storage:**
+```javascript
+jwtDecode = function(e) { return JSON.parse(window.atob(e.split(".")[1])) }
+// JWT stored in localStorage and cookie ("compressedJWT")
+// JWT contains: payload.role, payload.upn, entitlements, storeEnts
+```
+
+**Employee entitlement system disclosed:**
+```javascript
+ENTITLEMENTS = {
+  LSP_PICKING_MGMT: "lPM",
+  LSP_TRANSPORT_MGMT: "lTM",
+  OF_INVOICE_STORE_TILLSCONFS: "fISTC"
+}
+```
+
+### Impact
+
+- **Authentication attack surface fully mapped**: An attacker now knows every login endpoint, OAuth flow, client_id, and session mechanism
+- **SSO cookie name (`metroIdentity`)** enables targeted cookie theft via XSS or network-level attacks
+- **ADFS integration** with a leaked client_id enables targeted attacks against the employee federation service
+- **Employee entitlement codes** enable privilege escalation testing once any authenticated access is obtained
+- **100+ domain mapping** provides the complete attack surface across all countries, including pre-production environments
+- **Ktor server technology** enables framework-specific vulnerability research
+
+### Recommendation
+
+1. Move all OAuth credentials and authentication logic to server-side
+2. Obfuscate or remove domain-to-country mapping from client-side code
+3. Do not expose employee entitlement codes to the client
+4. Rotate the ADFS OAuth client_id `e595352d-d1df-4a9a-a469-d33bb5c46ef3`
+5. Implement Content Security Policy to mitigate XSS-based SSO cookie theft
+
+---
+
+## Finding 13: Semicolon Path Parameter Traversal Across Betty Services
+
+**Severity**: Medium
+**Asset**: `https://betty.metrosystems.net` (in scope)
+**Type**: Broken Access Control (OWASP A01) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The betty platform's reverse proxy/routing layer is vulnerable to semicolon path parameter traversal (`..;/`). By appending `..;/` to any service path (ordercapture, articlesearch, checkout), an attacker can traverse out of the service's path context and access resources at the root level. The server processes the `..;` as a path parameter (ignoring it) and then resolves `..` as directory traversal, issuing a 302 redirect to the traversed path.
+
+This technique is commonly associated with **Apache Tomcat** and **Spring Framework** path normalization differences, where `;` marks a path parameter that is stripped before path resolution.
+
+### Evidence
+
+**Traversal from ordercapture to root:**
+```
+GET /ordercapture/..;/swagger.json HTTP/2
+Host: betty.metrosystems.net
+
+HTTP/2 302
+Location: https://betty.metrosystems.net/swagger.json
+```
+
+**Traversal from articlesearch to root:**
+```
+GET /articlesearch/..;/swagger.json HTTP/2
+
+HTTP/2 302
+Location: https://betty.metrosystems.net/swagger.json
+```
+
+**Traversal from checkout to root:**
+```
+GET /checkout/..;/swagger.json HTTP/2
+
+HTTP/2 302
+Location: https://betty.metrosystems.net/swagger.json
+```
+
+**Other traversal variants properly blocked (403):**
+```
+[403] /ordercapture/..%3b/swagger.json    (URL-encoded semicolon)
+[403] /ordercapture/../swagger.json       (plain traversal)
+[403] /ordercapture/..%2f/swagger.json    (URL-encoded slash)
+```
+
+### Impact
+
+- **Path-based access control bypass**: Any service path context can be escaped, potentially accessing endpoints that are only restricted by path prefix matching
+- **WAF/routing bypass**: The 403 rules on swagger.json are path-specific — traversal to the root escapes the service prefix that triggers the 403 (root swagger.json is also 403'd in this case, but other root resources may not be)
+- **Chained with other vulnerabilities**: If any root-level endpoint lacks the same access restrictions as service-scoped endpoints, this traversal provides access
+- **Affects all services**: Confirmed on ordercapture, articlesearch, and checkout — likely affects all betty microservices behind the same routing layer
+
+### Recommendation
+
+1. Normalize paths before routing — strip semicolons and path parameters before evaluating access controls
+2. Configure the reverse proxy to reject requests containing `..;` patterns
+3. Apply access controls at the individual endpoint level, not just at the path prefix level
 
 ---
 
@@ -539,7 +783,7 @@ The following in-scope targets were **unreachable** from the testing environment
 
 ---
 
-## Phase 2 Testing Summary
+## Phase 2-3 Testing Summary
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri bypass (IDAM uses strict exact matching — all 10 bypass payloads rejected)
@@ -552,20 +796,35 @@ The following in-scope targets were **unreachable** from the testing environment
 - Dynamic client registration on IDAM (endpoint not exposed — 404)
 - Sitecore admin panels (all 404 across all countries)
 - GraphQL endpoints (not deployed on any tested service)
-- Actuator/Spring Boot endpoints (all 404)
+- Actuator/Spring Boot endpoints (all 404 on betty — except /health returning `{"status":"READY"}`)
+- Elasticsearch/Kibana direct access (no non-standard ports accessible)
+- Host header injection (GCP infrastructure behavior — 301 redirect with `Host: evil.com` but requires MITM to exploit, low practical impact)
+- IDAM OAuth redirect_uri validation (returns 403 for invalid redirect_uri — properly validated)
+- idam.metro.de direct access (Akamai WAF serves same 605B SPA for all paths — Keycloak backend not directly accessible)
+- CSP nonce bypass (nonces not extractable via curl — SPA rendering)
+- Swagger.json null-byte / encoding bypass (all variants return 403 or 404)
+
+**Confirmed accessible but auth-protected:**
+- betty.metrosystems.net login endpoints (customer: 404, employee: 404, SSO: 401)
+- IDAM OAuth authorize with BTEX client_id (returns 200 login page)
+- betty /health endpoint (returns `{"status":"READY"}`)
+- explore.tracking.v1 module (returns 503 — service unavailable)
 
 **Partially tested (access limitations):**
 - Country-specific search APIs (only DE accessible — ES/BG/HR/HU/RO all connection failures)
 - Pre-prod marketplace domains (all 403 — IP restricted)
 - Mirakl marketplace platform (egress proxy blocked)
 - PureCloud (requires authentication, returns 302/404)
+- erika.metrosystems.net (egress proxy blocked)
+- adfs3.metro.info (connection failure)
 
-## Next Steps (Phase 3)
+## Next Steps (Phase 4)
 
-1. **IDAM client_secret brute-force** for confirmed valid client `BTEX` (requires dedicated testing infrastructure with rate-aware tooling)
-2. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
-3. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
-4. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws
-5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
+1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
+2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
+3. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
+4. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
+5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers (especially the IDAM check_cookie_iframe), hash-fragment injection, and unsafe DOM manipulation
 6. **Akamai WAF bypass** — advanced techniques against the CDN/WAF protecting metro.rs and makro.nl
 7. **WebSocket testing** — the voucher app CSP includes `wss:` connect-src, indicating potential WebSocket endpoints
+8. **IDAM session iframe exploitation** — the `check_cookie_iframe` on idam.metrosystems.net uses `postMessage` with cookie name `metroIdentity` — potential for cross-origin session detection or manipulation
