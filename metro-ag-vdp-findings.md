@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **16 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **17 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
@@ -889,13 +889,17 @@ Internal routing uses plain HTTP — confirming TLS terminates at the edge/rever
 
 ### Description
 
-The Metro AG IDAM OAuth 2.0 authorization server has three compounding security issues:
+The Metro AG IDAM OAuth 2.0 authorization server has **five compounding security issues** that together form a complete authorization code/token theft chain:
 
 1. **Implicit grant enabled** (`response_type=token`) — deprecated in OAuth 2.1 (RFC draft) and explicitly discouraged by RFC 9700 (OAuth 2.0 Security Best Current Practice). Access tokens are returned in URL fragments, which leak via browser history, Referer headers, and JavaScript `window.location`.
 
 2. **Hybrid flow enabled** (`response_type=code token`) and **id_token flow** (`response_type=id_token`) — both put tokens in URL fragments with the same leakage risks.
 
 3. **redirect_uri accepts query parameter appending** — while the authorization server correctly rejects different hosts (returns 403), it **accepts arbitrary query parameters** appended to a valid redirect URI. This means `redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com` is accepted, and after authentication the authorization code/token is sent to this modified URL.
+
+4. **PKCE is NOT enforced** — the authorization endpoint accepts requests without `code_challenge` entirely, AND accepts `code_challenge_method=plain` (downgrade from S256). Without PKCE, intercepted authorization codes can be redeemed by any party.
+
+5. **State parameter NOT required** — the authorization endpoint processes requests without the `state` parameter, enabling OAuth login CSRF (an attacker can force-link their identity to a victim's session).
 
 ### Evidence
 
@@ -949,9 +953,45 @@ GET /authorize/api/oauth2/authorize?...&redirect_uri=https://evil.com/callback
 HTTP/2 403 (420 bytes — blocked by Akamai)
 ```
 
-**grant_types_supported confirms legacy flows active:**
+**PKCE NOT enforced — request WITHOUT code_challenge ACCEPTED:**
+```
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid
+    (NO code_challenge parameter)
+
+HTTP/2 200 (980 bytes — login page served normally)
+```
+
+**PKCE plain method ACCEPTED (downgrade from S256):**
+```
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid
+    &code_challenge=test_verifier&code_challenge_method=plain
+
+HTTP/2 200 (1045 bytes — login page served)
+```
+
+**State parameter NOT required — request WITHOUT state ACCEPTED:**
+```
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=BTEX&realm_id=BETTY_REALM
+    &redirect_uri=https://betty.metrosystems.net/shop&scope=openid
+    (NO state parameter)
+
+HTTP/2 200 (980 bytes — identical to requests with state)
+```
+
+**grant_types_supported lists deprecated/disabled grants:**
 ```json
 "grant_types_supported": ["refresh_token", "client_credentials", "implicit", "authorization_code", "password"]
+```
+Note: `password` is listed but returns "password grant type not supported" — the OIDC discovery document advertises capabilities that aren't actually available, violating the principle of minimal disclosure.
+
+**JWKS exposes 8 keys including infrastructure keys:**
+```
+kid=saml-signing-keypair      — SAML signing key
+kid=dyn-client-reg            — dynamic client registration key
+kid=token-signing-keypair     — current token signing
+kid=token-signing-keypair_17_12_2025 — dated key (rotation history visible)
 ```
 
 ### Impact
@@ -965,22 +1005,28 @@ HTTP/2 403 (420 bytes — blocked by Akamai)
   1. If the betty SPA processes the `url` parameter as a redirect destination (common in SPAs), the user is redirected to `evil.com` WITH the authorization code
   2. Even without client-side redirect, the authorization code is now associated with a URL containing attacker-controlled data
 
-- **Chained attack scenario**: An attacker combines implicit grant + redirect_uri injection:
-  1. Craft: `response_type=token&redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com`
+- **Chained attack scenario (full kill chain)**: An attacker combines ALL five issues:
+  1. Craft: `response_type=token&redirect_uri=https://betty.metrosystems.net/shop?url=https://evil.com` (no state, no PKCE)
   2. Victim authenticates normally on the legitimate IDAM login page
   3. Token is redirected to `https://betty.metrosystems.net/shop?url=https://evil.com#access_token=VICTIM_TOKEN`
   4. If the SPA processes `url` parameter → full account takeover
+  5. No PKCE means intercepted authorization codes (via the query param injection) are directly redeemable
+  6. No state means login CSRF is possible — attacker can force-link their own OAuth identity to the victim's session
 
-- **RFC non-compliance**: Violates RFC 9700 Section 2.1.2 (implicit grant SHOULD NOT be used), Section 4.1.3 (redirect_uri must be compared using exact string matching)
+- **OAuth login CSRF**: Without `state`, an attacker can initiate an OAuth flow, capture the callback URL (with their own authorization code), and trick a victim into loading it — linking the attacker's identity to the victim's account
+
+- **RFC non-compliance**: Violates RFC 9700 Section 2.1.2 (implicit grant SHOULD NOT be used), Section 4.1.3 (redirect_uri must be compared using exact string matching), Section 2.1.1 (PKCE MUST be used), and Section 4.3.3 (state SHOULD be used to prevent CSRF)
 
 ### Recommendation
 
 1. **Disable implicit grant** — remove `token` from supported response types; use authorization code flow with PKCE exclusively
 2. **Disable hybrid flow** — remove `code token` and `code id_token token` from supported response types
 3. **Enforce exact redirect_uri matching** — reject any redirect_uri that does not exactly match a pre-registered value (no query parameter appending, no path modification)
-4. **Require PKCE** for all OAuth clients — enforce `code_challenge` and `code_challenge_method=S256`
-5. **Remove `password` grant type** — deprecated and insecure
-6. **Audit `token_endpoint_auth_methods_supported: ["none"]`** — ensure only appropriate public clients can use unauthenticated token requests
+4. **Require PKCE** for all OAuth clients — enforce `code_challenge` and `code_challenge_method=S256`; reject `plain` method
+5. **Require and validate state parameter** — the authorization server should reject requests without `state` to prevent OAuth login CSRF
+6. **Remove `password` from `grant_types_supported`** — do not advertise unsupported/deprecated grants in the OIDC discovery document
+7. **Audit `token_endpoint_auth_methods_supported: ["none"]`** — ensure only appropriate public clients can use unauthenticated token requests
+8. **Minimize JWKS exposure** — remove infrastructure keys (`dyn-client-reg`, `saml-signing-keypair`) from the public JWKS endpoint; rotate dated keys
 
 ---
 
@@ -1030,6 +1076,78 @@ However, `X-Frame-Options: ALLOW-FROM` is deprecated and inconsistently enforced
 
 ---
 
+## Finding 17: Overly Permissive CSP with `unsafe-eval` and Wildcard WebSocket + Internal API URL Leak
+
+**Severity**: Medium
+**Assets**: `https://betty.metrosystems.net/shop` (in scope), `https://betty.metrosystems.net/depotmanagement/stocklocation/` (in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Information Disclosure (OWASP A02)
+
+### Description
+
+The betty shop SPA's Content Security Policy (CSP) contains multiple weaknesses that significantly reduce its effectiveness as an XSS mitigation:
+
+1. **`unsafe-eval` in script-src** — allows `eval()`, `new Function()`, `setTimeout('string')`, and similar dynamic code execution, negating much of the CSP's protection even with nonce-based script loading
+2. **`wss://*` in connect-src** — permits WebSocket connections to **any host**, enabling data exfiltration via WebSocket if XSS is achieved
+3. **Extremely broad script-src whitelist** — includes `*.google.com`, `*.googletagmanager.com`, `*.facebook.com`, `*.microsoft.com`, `*.gstatic.com`, and many more 3rd-party wildcard domains; if any of these hosts have a JSONP or Angular callback endpoint, CSP can be bypassed entirely
+
+Additionally, the stocklocation endpoint's 401 response leaks an **internal production API URL** via the `WWW-Authenticate` header, and sets a JSESSIONID cookie confirming a Java Servlet backend.
+
+### Evidence
+
+**CSP from betty.metrosystems.net/shop response header:**
+```
+script-src 'self' https://*.metro.de https://*.metrosystems.net https://*.metro-group.com
+  https://*.metro-online.com https://*.metro.info https://*.metro-marketplace.cloud
+  https://*.googletagmanager.com https://*.qualtrics.com https://*.google-analytics.com
+  https://www.googleadservices.com https://*.gstatic.com https://*.google.com
+  https://*.google.de https://google.de https://*.googleads.g.doubleclick.net
+  https://connect.facebook.net https://graph.facebook.com https://staticxx.facebook.com
+  https://bat.bing.com https://snap.licdn.com https://*.microsoft.com
+  https://analytics.tiktok.com https://*.mypurecloud.de https://*.nr-data.net
+  https://*.newrelic.com 'nonce-...' 'unsafe-eval';
+
+connect-src 'self' [...many domains...] wss://*;
+
+font-src 'self' https://*;
+```
+
+**CSP nonces ARE properly random per-request (not exploitable):**
+```
+Request 1: nonce-FdGdraIMdSfdfNxO
+Request 2: nonce-2QjdVDr3
+Request 3: nonce-CIm69aiFlR5w6gJkty7
+```
+
+**Internal production API URL leaked via stocklocation 401:**
+```
+GET /depotmanagement/stocklocation/location/ HTTP/2
+Host: betty.metrosystems.net
+
+HTTP/2 401
+Set-Cookie: JSESSIONID=41026C7186A5F678CABFBE526D7F9584; Path=/depotmanagement/stocklocation; Secure; HttpOnly
+WWW-Authenticate: Bearer resource_metadata="https://api-internal.prod.mfulfilldepot.metro.cloud/depotmanagement/stocklocation/.well-known/oauth-protected-resource"
+```
+
+**Internal hostname revealed**: `api-internal.prod.mfulfilldepot.metro.cloud`
+**Java Servlet backend confirmed**: JSESSIONID cookie set
+
+### Impact
+
+- **XSS amplification**: `unsafe-eval` allows attackers who find any DOM-based injection point to execute arbitrary JavaScript via `eval()` — the CSP nonce becomes irrelevant
+- **Data exfiltration via WebSocket**: `wss://*` means that even if all HTTP exfiltration is blocked by CSP, an attacker can exfiltrate stolen data (cookies, tokens, PII) via a WebSocket connection to any attacker-controlled host
+- **CSP bypass via 3rd-party JSONP**: The broad wildcard whitelist (e.g., `*.google.com`) includes hosts known to have JSONP/callback endpoints that can be abused to execute arbitrary JavaScript without matching the nonce
+- **Internal API topology revealed**: `api-internal.prod.mfulfilldepot.metro.cloud` exposes the internal API naming convention (`api-internal.prod.<service>.metro.cloud`), enabling targeted SSRF attacks if any SSRF vulnerability exists
+
+### Recommendation
+
+1. Remove `unsafe-eval` from `script-src` — refactor JavaScript to avoid `eval()` and similar patterns
+2. Replace `wss://*` in `connect-src` with explicit WebSocket endpoints
+3. Narrow `script-src` to specific paths rather than wildcard subdomains — or migrate to a strict nonce-only CSP
+4. Replace `https://*` in `font-src` with specific font CDN origins
+5. Remove `api-internal.prod.mfulfilldepot.metro.cloud` from the `WWW-Authenticate` header — use a generic resource indicator instead
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -1062,9 +1180,16 @@ The following in-scope targets were **unreachable** from the testing environment
 - Verbose health endpoints on orderservice (43 components) and checkout (10 components) (Finding 14)
 - 401 error bodies leak Java servlet class, internal HTTP URIs, and auth header convention (Finding 14)
 - check_cookie_iframe postMessage session detection (Finding 16)
+- CSP `unsafe-eval` + `wss://*` weaknesses (Finding 17)
+- Internal API URL leak via WWW-Authenticate header (Finding 17)
+- PKCE not enforced and state parameter not required on IDAM (Finding 15)
+- PKCE plain method accepted (downgrade from S256) (Finding 15)
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
+- IDAM device code grant (404 — not implemented)
+- IDAM ROPC/password grant (listed in discovery but returns "not supported")
+- CSP nonce prediction (nonces are properly random per-request)
 - JWT algorithm confusion RS256→HS256 (server rejects HS256 tokens, 500 but not exploitable)
 - JWT kid SQL injection / path traversal (reflected but no injection — kid lookup against static JWKS)
 - Server-side XSS on betty shops (SPA architecture — no server-side template rendering)
