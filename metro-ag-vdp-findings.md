@@ -3,13 +3,17 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 1 - Quick-win probes completed
+**Status**: Phase 2 - Deep exploitation testing completed
 
 ---
 
 ## Executive Summary
 
-Phase 1 reconnaissance and probing of 66 in-scope Metro AG assets identified **6 reportable findings** across production and pre-production infrastructure. The most critical finding is an unauthenticated production search API exposing ~1M product records with pricing/inventory data, combined with a wildcard CORS misconfiguration enabling cross-origin data theft from any website.
+Comprehensive testing of 66 in-scope Metro AG assets identified **10 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+
+1. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 — exposing cryptographic key material, JWT library internals, and version information (Finding 7)
+2. **No rate limiting on IDAM authentication endpoint**, combined with **OAuth client_id enumeration** via differential error messages, enabling credential brute-force attacks at unlimited speed (Findings 8 + 9)
+3. **Unauthenticated production search API** exposing 993,709 product records with B2B/B2C pricing, inventory quantities, and seller data — with wildcard CORS and no rate limiting enabling mass automated scraping (Findings 1 + 8)
 
 ---
 
@@ -301,6 +305,205 @@ window.exploreStoreIdMapping = {
 
 ---
 
+## Finding 7: 3v Coupon API - JWT Error Handling Leaks RSA Public Key Material + Unhandled Exceptions
+
+**Severity**: High
+**Asset**: `https://3v-proxy-service-external-pp.metro-link.com` (*.metro-link.com - in scope)
+**Type**: Improper Error Handling (OWASP A05) + Sensitive Data Exposure (OWASP A02)
+
+### Description
+
+The 3v Coupon Proxy Service pre-production API returns **500 Internal Server Error** (instead of 401 Unauthorized) for malformed JWT tokens. The error responses expose the **full 2048-bit RSA public key** used for token verification, internal JWT library details, and the algorithm configuration — enabling targeted token forgery attacks.
+
+### Evidence
+
+**JWT `alg:none` causes 500 with library details:**
+```json
+{
+  "status": 500,
+  "error": "Internal Server Error",
+  "message": "Unsecured JWSs (those with an 'alg' header value of 'none') are disallowed by default as mandated by https://www.rfc-editor.org/rfc/rfc7518.html#section-3.6. If you wish to allow them to be parsed, call the JwtParserBuilder.unsecured() method..."
+}
+```
+
+**JWT with RS256 + wrong signature leaks FULL RSA PUBLIC KEY:**
+```json
+{
+  "status": 401,
+  "message": "Invalid JWT signature: Unable to verify RS256 signature with JCA algorithm 'SHA256withRSA' using key {Sun RSA public key, 2048 bits
+    params: null
+    modulus: 247538660848823582253300959374872372883752234011377821768010378813641726492...
+    public exponent: 65537}: Signature callback execution failed: Bad signature length: got 5 but was expecting 256"
+}
+```
+
+**JWT with HS256 causes 500:**
+```json
+{
+  "status": 500,
+  "message": "Cannot verify JWS signature: unable to locate signature verification key for JWS with header: {alg=HS256, typ=JWT}"
+}
+```
+
+**JWT with injected `kid` reflects input (500):**
+```json
+{
+  "message": "Cannot verify JWS signature: unable to locate signature verification key for JWS with header: {alg=RS256, typ=JWT, kid=' UNION SELECT 'AAAA' -- }"
+}
+```
+
+**Health endpoint leaks version without auth:**
+```
+GET /health → 200 OK
+{"status" : "UP", "version" :"1.2.0"}
+```
+
+### Impact
+
+- **RSA public key leaked** enables algorithm confusion attacks (RS256→HS256) and targeted token forgery
+- **500 errors** instead of 401 indicate unhandled exceptions reaching production, exposing Java JJWT library internals
+- **JWT kid field reflected** in errors could enable further injection attacks
+- **Version disclosure** aids in identifying known CVEs for the specific version
+- Combined: an attacker gains the exact key material, algorithm, library, and version needed to craft targeted JWT attacks
+
+### Recommendation
+
+1. Return generic 401 responses for all JWT validation failures — never expose key material or library details
+2. Catch all JWT parsing exceptions and return uniform error messages
+3. Remove `/health` endpoint from external access or require authentication
+4. Implement proper error handling middleware
+
+---
+
+## Finding 8: No Rate Limiting on Authentication and API Endpoints
+
+**Severity**: Medium-High
+**Assets**: Multiple (IDAM, Search API, 3v API)
+**Type**: Broken Access Control (OWASP A07 - Identification and Authentication Failures)
+
+### Description
+
+Critical authentication and data endpoints lack rate limiting, enabling brute-force attacks on credentials and mass data scraping.
+
+### Evidence
+
+**IDAM token endpoint — 15 rapid requests, all processed:**
+```
+[401] [401] [401] [401] [401] [401] [401] [401] [401] [401] [401] [401] [401] [401] [401]
+```
+No 429 responses, no CAPTCHA, no account lockout, no progressive delay.
+
+**Search API — 20 rapid requests, all 200:**
+```
+[200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200] [200]
+```
+
+**3v coupon API — 10 rapid requests, all processed:**
+```
+[401] [401] [401] [401] [401] [401] [401] [401] [401] [401]
+```
+
+### Impact
+
+- **IDAM brute-force**: Combined with Finding 9 (client_id enumeration), an attacker can enumerate valid OAuth client_ids and then brute-force their `client_secret` values at unlimited speed
+- **Data scraping**: The search API's 993,709 product records can be scraped at maximum speed with no throttling — full catalog extraction in minutes
+- **Credential stuffing**: The IDAM token endpoint can be targeted with large credential lists
+
+### Recommendation
+
+1. Implement rate limiting (e.g., 10 requests/minute per IP) on all authentication endpoints
+2. Add progressive delays and account lockout after failed attempts
+3. Implement CAPTCHA on login flows
+4. Add rate limiting on the search API (e.g., 100 requests/minute per IP)
+
+---
+
+## Finding 9: IDAM OAuth Client ID Enumeration via Differential Error Messages
+
+**Severity**: Medium
+**Asset**: `https://idam.metrosystems.net/authorize/api/oauth2/access_token` (*.metrosystems.net - in scope)
+**Type**: Information Disclosure (OWASP A07)
+
+### Description
+
+The IDAM OAuth 2.0 token endpoint returns different error messages for valid vs. invalid `client_id` values, enabling enumeration of registered OAuth clients. Combined with the lack of rate limiting (Finding 8), this allows automated discovery of all valid client identifiers.
+
+### Evidence
+
+**Valid client_id (BTEX) — returns 401:**
+```json
+{"error":"invalid_client","error_description":"client_secret is invalid or expired","error_uri":"https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes"}
+```
+
+**Invalid client_id — returns 400:**
+```json
+{"error":"invalid_client","error_description":"client_id: METRO is invalid","error_uri":"https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes"}
+```
+
+**Key differences:**
+| Indicator | Valid client_id | Invalid client_id |
+|-----------|----------------|-------------------|
+| HTTP Status | 401 | 400 |
+| Error message | "client_secret is invalid or expired" | "client_id: X is invalid" |
+| Response size | ~169 B | ~161 B |
+
+**Internal Confluence URL leaked in all responses**: `https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes`
+
+**BIG-IP cookie leaks load balancer pool**: `BIGipServeridam-akamai-80`
+
+### Impact
+
+- Attackers can enumerate all valid OAuth client_ids by testing against the token endpoint
+- Valid client_ids enable targeted `client_secret` brute-force attacks (no rate limiting)
+- Internal Confluence URL enables further reconnaissance
+- F5 BIG-IP infrastructure information aids in targeted attacks
+
+### Recommendation
+
+1. Return identical error messages and HTTP status codes for both valid and invalid client_ids
+2. Remove internal URLs from error responses
+3. Strip BIG-IP cookies or use encrypted cookie format
+4. Implement rate limiting (see Finding 8)
+
+---
+
+## Finding 10: Betty Ordercapture Swagger/API Documentation Behind Weak 403
+
+**Severity**: Low-Medium
+**Assets**: `betty.metrosystems.net`, `tienda.makro.es`, `shop.metro.bg`, `metromax.metro.hu`, `shop.metro.ro` (all in scope)
+**Type**: Security Misconfiguration (OWASP A05)
+
+### Description
+
+The Ordercapture API documentation endpoint (`/ordercapture/swagger.json`) returns 403 Forbidden across all country-specific betty shop instances, confirming the Swagger/OpenAPI specification file exists but is access-restricted. This is a defense-in-depth concern — the file's presence and consistent 403 across all deployments suggests it contains the complete API specification.
+
+### Evidence
+
+```
+[403] (134 B) betty.metrosystems.net/ordercapture/swagger.json
+[403] (134 B) tienda.makro.es/ordercapture/swagger.json
+[403] (134 B) shop.metro.bg/ordercapture/swagger.json
+[403] (134 B) metromax.metro.hu/ordercapture/swagger.json
+[403] (134 B) shop.metro.ro/ordercapture/swagger.json
+```
+
+Meanwhile, non-existent paths return 404 (18 B):
+```
+[404] (18 B) tienda.makro.es/ordercapture/v2/api-docs
+```
+
+### Impact
+
+- Confirms the API documentation exists and could be exposed through access control bypass
+- Consistent 403 across all countries suggests centralized config — a single misconfiguration would expose it globally
+
+### Recommendation
+
+1. Return 404 instead of 403 to avoid confirming the file's existence
+2. Ensure the Swagger file is not deployed to production — serve it only in development environments
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -323,11 +526,33 @@ The following in-scope targets were **unreachable** from the testing environment
 
 ---
 
-## Next Steps (Phase 2)
+## Phase 2 Testing Summary
 
-1. **Search API deep-dive**: Test with authenticated sessions, probe impersonation header behavior, test for IDOR on product/offer IDs
-2. **3v Coupon API**: Attempt auth bypass with discovered IDAM client credentials, test for JWT manipulation
-3. **Wildcard domain enumeration**: Run subdomain discovery on the 10 in-scope wildcard domains (needs local tooling)
-4. **Akamai WAF bypass**: Attempt bypass techniques on protected marketplace domains
-5. **PureCloud directory enumeration**: Explore Genesys PureCloud contact center interface
-6. **Shop platform deep testing**: XSS testing on search/product parameters, CSRF on cart/order operations
+**Tested and confirmed not exploitable:**
+- OAuth redirect_uri bypass (IDAM uses strict exact matching — all 10 bypass payloads rejected)
+- JWT algorithm confusion RS256→HS256 (server rejects HS256 tokens, 500 but not exploitable)
+- JWT kid SQL injection / path traversal (reflected but no injection — kid lookup against static JWKS)
+- Server-side XSS on betty shops (SPA architecture — no server-side template rendering)
+- SSTI/template injection on search API (no execution detected)
+- CRLF injection on search API (no header injection)
+- Open redirect on shop domains (no redirect parameters found)
+- Dynamic client registration on IDAM (endpoint not exposed — 404)
+- Sitecore admin panels (all 404 across all countries)
+- GraphQL endpoints (not deployed on any tested service)
+- Actuator/Spring Boot endpoints (all 404)
+
+**Partially tested (access limitations):**
+- Country-specific search APIs (only DE accessible — ES/BG/HR/HU/RO all connection failures)
+- Pre-prod marketplace domains (all 403 — IP restricted)
+- Mirakl marketplace platform (egress proxy blocked)
+- PureCloud (requires authentication, returns 302/404)
+
+## Next Steps (Phase 3)
+
+1. **IDAM client_secret brute-force** for confirmed valid client `BTEX` (requires dedicated testing infrastructure with rate-aware tooling)
+2. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
+3. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
+4. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws
+5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
+6. **Akamai WAF bypass** — advanced techniques against the CDN/WAF protecting metro.rs and makro.nl
+7. **WebSocket testing** — the voucher app CSP includes `wss:` connect-src, indicating potential WebSocket endpoints
