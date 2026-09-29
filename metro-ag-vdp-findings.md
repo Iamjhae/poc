@@ -308,16 +308,19 @@ window.exploreStoreIdMapping = {
 ## Finding 7: 3v Coupon API - JWT Error Handling Leaks RSA Public Key Material + Unhandled Exceptions
 
 **Severity**: High
-**Asset**: `https://3v-proxy-service-external-pp.metro-link.com` (*.metro-link.com - in scope)
+**Assets**: 
+- `https://3v-proxy-service-external-prod.metro-link.com` (PRODUCTION)
+- `https://3v-proxy-service-external-pp.metro-link.com` (Pre-production)
+- Both under *.metro-link.com — in scope
 **Type**: Improper Error Handling (OWASP A05) + Sensitive Data Exposure (OWASP A02)
 
 ### Description
 
-The 3v Coupon Proxy Service pre-production API returns **500 Internal Server Error** (instead of 401 Unauthorized) for malformed JWT tokens. The error responses expose the **full 2048-bit RSA public key** used for token verification, internal JWT library details, and the algorithm configuration — enabling targeted token forgery attacks.
+The 3v Coupon Proxy Service **production AND pre-production** APIs return **500 Internal Server Error** (instead of 401 Unauthorized) for malformed JWT tokens. The error responses expose the **full 2048-bit RSA public key** used for token verification, internal JWT library details, and the algorithm configuration — enabling targeted token forgery attacks. **The same RSA key is shared between production and pre-production**, and the same version (1.2.0) is deployed to both.
 
 ### Evidence
 
-**JWT `alg:none` causes 500 with library details:**
+**JWT `alg:none` causes 500 with library details (confirmed on BOTH prod and pre-prod):**
 ```json
 {
   "status": 500,
@@ -352,19 +355,29 @@ The 3v Coupon Proxy Service pre-production API returns **500 Internal Server Err
 }
 ```
 
-**Health endpoint leaks version without auth:**
+**Health endpoint leaks version without auth (BOTH environments):**
 ```
-GET /health → 200 OK
+GET https://3v-proxy-service-external-prod.metro-link.com/health → 200 OK
+GET https://3v-proxy-service-external-pp.metro-link.com/health → 200 OK
 {"status" : "UP", "version" :"1.2.0"}
+```
+
+**Three production coupon service paths confirmed:**
+```
+[401] /3v.redeemable.service.rest  (coupon redemption)
+[401] /3v.campaign.service.rest    (campaign management)
+[401] /3v.issuance.service.rest    (coupon issuance)
 ```
 
 ### Impact
 
+- **PRODUCTION system** — this handles real coupon/voucher operations for Metro AG customers
 - **RSA public key leaked** enables algorithm confusion attacks (RS256→HS256) and targeted token forgery
+- **Same key shared between prod and pre-prod** — compromising one environment's key material applies to both
 - **500 errors** instead of 401 indicate unhandled exceptions reaching production, exposing Java JJWT library internals
 - **JWT kid field reflected** in errors could enable further injection attacks
 - **Version disclosure** aids in identifying known CVEs for the specific version
-- Combined: an attacker gains the exact key material, algorithm, library, and version needed to craft targeted JWT attacks
+- Combined: an attacker gains the exact key material, algorithm, library, and version needed to craft targeted JWT attacks against the production coupon system
 
 ### Recommendation
 
