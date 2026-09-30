@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 15 - Seller inventory microservice exposure, IDAM pre-prod OAuth, XML-RPC correction
+**Status**: Phase 16 - IDAM OAuth client misconfigurations, internal infrastructure disclosure, pre-prod platform exposure
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **38 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **40 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3816,12 +3816,199 @@ Set-Cookie: BIGipServeridam-akamai-80=!uERPyY9k/fCtTX+...;
 
 ---
 
-## Next Steps (Phase 15)
+## Finding 39: IDAM Pre-Production OAuth Clients Expose Internal Infrastructure via Response Headers
+
+**Severity**: Medium (CVSS 6.5)
+**Asset**: `idam-pp.metro.it`, `idam-pp.metrosystems.net` (*.metrosystems.net - in scope)
+**Type**: Information Disclosure (OWASP A01) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The IDAM pre-production OAuth authorization server dynamically generates `X-Frame-Options` and CSP `frame-ancestors` headers based on the OAuth client configuration. When queried with known client IDs (AXCSS, BTEX), these headers leak **14 internal development and pre-production hostnames** including non-routable internal domains, Sitecore CMS infrastructure, and plaintext HTTP services. Additionally, the IDAM register endpoint CORS headers expose a Kubernetes POC cluster hostname.
+
+The AXCSS OAuth client (Italian customer self-service portal) has multiple RFC 9700 violations:
+1. **Implicit flow enabled** — `response_type=token` accepted (HTTP 200)
+2. **PKCE plain method accepted** — `code_challenge_method=plain` accepted
+3. **Loose redirect_uri path validation** — any path on `my-pp.metro.it` accepted (e.g., `/anything`)
+
+### Evidence
+
+**Internal hostnames leaked via X-Frame-Options and CSP frame-ancestors:**
+```
+Request:
+GET /authorize/api/oauth2/authorize?response_type=code&client_id=AXCSS&realm_id=SSO_CUST_IT
+    &redirect_uri=https://my-pp.metro.it&scope=openid&state=test
+Host: idam-pp.metro.it
+
+Response:
+HTTP/2 200
+x-frame-options: ALLOW-FROM https://marketplace-pp.metro.it https://sc10sc.dev.local
+  https://local.mm.metro.it https://authors-rev-sc.metro.it https://authors-dev2-sc.metro.it
+  https://www-rev-sc.metro.it https://nextcms102.sc https://my-pp.metro.it
+  http://prodotti-pp.metro.it https://www-dev2-sc.metro.it https://consegne-pp.metro.it
+  https://www-metro.it.local https://integration.marketplace-pp.metro.it
+  https://s.marketplace-pp.metro.it
+
+content-security-policy: ... frame-ancestors https://marketplace-pp.metro.it
+  https://sc10sc.dev.local https://local.mm.metro.it [same 14 origins]
+```
+
+**Internal hostnames revealed:**
+| Hostname | Type | Significance |
+|---|---|---|
+| `sc10sc.dev.local` | Non-routable | Internal Sitecore dev server |
+| `local.mm.metro.it` | Non-routable | Local Metro Markets dev |
+| `nextcms102.sc` | Non-routable | Next CMS (no TLD — bare hostname) |
+| `www-metro.it.local` | Non-routable | Local dev hostname |
+| `authors-rev-sc.metro.it` | Sitecore CMS | Content authors review (403) |
+| `authors-dev2-sc.metro.it` | Sitecore CMS | Content authors dev2 (403) |
+| `www-rev-sc.metro.it` | Sitecore CMS | WWW review environment (403) |
+| `www-dev2-sc.metro.it` | Sitecore CMS | WWW dev2 environment (403) |
+| `http://prodotti-pp.metro.it` | HTTP (no TLS!) | Pre-prod products over plaintext |
+| `marketplace-pp.metro.it` | Pre-prod | Marketplace pre-production (403) |
+| `integration.marketplace-pp.metro.it` | Integration | Integration test marketplace (404) |
+| `s.marketplace-pp.metro.it` | Staging | Staging marketplace (404/308) |
+| `consegne-pp.metro.it` | Pre-prod | Delivery pre-production (active) |
+| `my-pp.metro.it` | Pre-prod | Self-service pre-production (active) |
+
+**IDAM register endpoint leaks Kubernetes POC cluster:**
+```
+GET /authorize/api/oauth2/register
+Host: idam-pp.metro.it
+
+HTTP/2 404
+access-control-allow-origin: http://halipoc-k8s2.test1.mcc.gb-lon1.metroscales.io:30006 http://localhost:8001
+```
+This reveals: internal K8s cluster `halipoc-k8s2` in London datacenter (`gb-lon1`), the `metroscales.io` domain for internal infrastructure, and NodePort 30006.
+
+**IDAM error responses leak internal Confluence:**
+```json
+{
+  "error": "invalid_client",
+  "error_description": "client_secret is invalid or expired",
+  "error_uri": "https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes"
+}
+```
+
+**Password grant reveals custom parameter:**
+```json
+{
+  "error": "invalid_request",
+  "error_description": "user_type is missing_or_repeated"
+}
+```
+
+**redirect_uri path validation is origin-only:**
+```
+redirect_uri=https://my-pp.metro.it/anything    → 200 (accepted)
+redirect_uri=https://my-pp.metro.it.evil.com    → 400 (rejected)
+redirect_uri=https://evil.com                   → 400 (rejected)
+```
+
+### Impact
+
+- **Internal network reconnaissance**: 14 internal hostnames reveal the entire Sitecore CMS infrastructure (`sc` suffix pattern), development environment naming scheme (rev, dev2), and staging topology
+- **Kubernetes cluster exposure**: The `halipoc-k8s2.test1.mcc.gb-lon1.metroscales.io:30006` reveals internal K8s cluster names, datacenter locations, and NodePort assignments
+- **HTTP in production frame-ancestors**: `http://prodotti-pp.metro.it` in frame-ancestors allows MitM-based framing attacks on pre-production
+- **OAuth attack chain**: Implicit flow + loose redirect_uri path matching enables token theft if any path on my-pp.metro.it can be controlled (file upload, open redirect)
+- **Social engineering**: Internal domain names aid targeted spear-phishing against Metro AG employees
+
+### Recommendation
+
+1. Remove internal/non-routable hostnames from OAuth client configurations
+2. Disable implicit flow on all IDAM OAuth clients (per RFC 9700)
+3. Enforce exact redirect_uri matching (path + query) not just origin validation
+4. Replace `http://` with `https://` in all frame-ancestors entries
+5. Remove internal hostnames from CORS `Access-Control-Allow-Origin` headers
+6. Sanitize error responses to not include internal Confluence URLs
+7. Restrict IDAM register and userinfo endpoints to authenticated access
+
+---
+
+## Finding 40: Pre-Production Betty Platform Fully Accessible with Internal Architecture Disclosure
+
+**Severity**: Medium (CVSS 5.3)
+**Asset**: `consegne-pp.metro.it`, `prodotti-pp.metro.it`, `my-pp.metro.it` (*.metro.it - in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Information Disclosure (OWASP A01)
+
+### Description
+
+Three pre-production Betty platform domains are fully internet-accessible without VPN or IP restriction. These pre-production environments serve the complete shop application with identical functionality to production, expose detailed CSP headers revealing internal architecture, and provide a testing ground for developing attacks against production. The `my-pp.metro.it` self-service portal additionally exposes Apollo GraphQL infrastructure, reCAPTCHA integration, and the Phrase.com translation management platform.
+
+### Evidence
+
+**Pre-production Betty shop domains serving full application:**
+```
+https://consegne-pp.metro.it/shop → 200 (full Betty shop platform, Italian delivery pre-prod)
+https://prodotti-pp.metro.it/shop → 200 (full Betty shop platform, Italian products pre-prod)
+https://my-pp.metro.it/personal/  → 302 → login (self-service portal pre-prod)
+```
+
+**Pre-prod CSP headers leak extensive infrastructure (consegne-pp.metro.it):**
+```
+content-security-policy:
+  script-src: https://*.metro.it https://*.metrosystems.net https://*.metro-group.com
+    https://*.metro-online.com https://*.metro.info https://*.metro.de
+    https://*.metro-marketplace.cloud ... 'unsafe-eval'
+  connect-src: ... wss://* ... https://adobedc.demdex.net https://*.adobedc.net
+    https://*.datadoghq.eu https://rum.browser-intake-datadoghq.eu
+    https://shyrka-prod-euc1.s3.eu-central-1.amazonaws.com
+    https://login.microsoftonline.com https://graph.microsoft.com
+  report-uri: https://consegne-pp.metro.it/ordercapture/uidispatcher/rest/report-csp-violation
+```
+
+**my-pp.metro.it CSP reveals additional services:**
+```
+content-security-policy:
+  script-src: ... https://www.recaptcha.net ... 'unsafe-eval'
+  frame-src: ... https://idam-pp.metrosystems.net https://idam-pp.metro.it
+    embeddable-sandbox.cdn.apollographql.com sandbox.embed.apollographql.com
+    https://www.recaptcha.net ... feedback.metro-cc.com
+  connect-src: ... https://idam-pp.metro.it ... api.phrase.com
+  font-src: fonts.gstatic.com ... www-rev-sc.metro.it cdn-rev-sc.metro-online.com
+```
+
+**Key disclosures from pre-prod CSP:**
+- **Apollo GraphQL sandbox**: `embeddable-sandbox.cdn.apollographql.com` — GraphQL API explorer accessible
+- **Phrase.com**: `api.phrase.com` — Translation management integration
+- **reCAPTCHA**: Rate limiting/bot protection mechanism identified
+- **Datadog RUM**: `rum.browser-intake-datadoghq.eu` — Real User Monitoring
+- **Microsoft Graph**: `login.microsoftonline.com`, `graph.microsoft.com` — Azure AD integration
+- **Amazon S3 bucket**: `shyrka-prod-euc1.s3.eu-central-1.amazonaws.com` — PROD S3 bucket accessed from pre-prod
+- **CSP report-uri**: Active violation reporting endpoint
+- **Sitecore CDN**: `cdn-rev-sc.metro-online.com` — Content delivery from Sitecore review environment
+- **`wss://*` wildcard**: Same WebSocket CSP weakness as production (Finding 29)
+
+**Pre-prod scripts.js accessible:**
+```
+https://consegne-pp.metro.it/shop/scripts.js → 200
+https://prodotti-pp.metro.it/shop/scripts.js → 200
+```
+
+### Impact
+
+- **Pre-production attack staging**: Full pre-prod access allows developing and testing exploits before targeting production; OAuth flows, API endpoints, and business logic can be probed without risk of production monitoring
+- **Cross-environment data leakage**: Pre-prod CSP references PROD S3 bucket (`shyrka-prod-euc1.s3.eu-central-1.amazonaws.com`) — production data may be accessible from pre-prod
+- **Internal architecture mapping**: CSP headers reveal the complete service mesh (Datadog, Apollo GraphQL, Phrase, Microsoft Graph, reCAPTCHA) which informs targeted attacks
+- **Shared IDAM platform**: Pre-prod apps use `idam-pp.metro.it` and `idam-pp.metrosystems.net` — credentials from pre-prod reconnaissance could be reused against production IDAM
+
+### Recommendation
+
+1. Restrict all pre-production domains to VPN/internal access only
+2. Remove production S3 bucket references from pre-prod CSP
+3. Implement IP allowlisting on pre-production load balancers
+4. Use separate IDAM instances for pre-prod and production
+5. Ensure pre-prod CSP does not reference `wss://*` wildcard
+
+---
+
+## Next Steps (Phase 16)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform and seller inventory API
-2. **DOM-based XSS** — Module Federation `Function()` calls combined with `unsafe-eval` CSP; analyze SPA source maps for injection points
-3. **WordPress plugin CVE testing** — check detected plugin versions on metro-markets.de for known vulnerabilities (wp-media-folder 6.2.8, PersonioWP 1.0.0)
-4. **Open redirect chaining with Finding 15** — complete the authorization code theft chain
+2. **Apollo GraphQL exploration** — my-pp.metro.it uses Apollo GraphQL; test introspection and query enumeration
+3. **WordPress plugin CVE testing** — wp-media-folder 6.2.8 confirmed; check for CVE-2023-6623 (LFI) and other known vulns
+4. **Open redirect chaining** — chain AXCSS loose redirect_uri (Finding 39) with any open redirect on my-pp.metro.it for token theft
 5. **Subdomain enumeration** on 10 in-scope wildcard domains
-6. **ConfigCat feature flag extraction** — the SDK key is server-injected; intercept via browser to extract feature flags potentially exposing hidden functionality
-7. **Seller inventory API route discovery** — `/api/v1/products` confirmed as valid endpoint; enumerate additional product/order/offer routes
+6. **S3 bucket probe** — `shyrka-prod-euc1.s3.eu-central-1.amazonaws.com` referenced in pre-prod CSP
+7. **Seller inventory API route discovery** — `/api/v1/products` confirmed as valid endpoint; enumerate additional routes
+8. **Sitecore CMS domains** — 4 Sitecore domains return 403; probe for bypass paths
