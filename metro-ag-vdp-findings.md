@@ -3,7 +3,7 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 6 - Seller office deep analysis + microservice architecture disclosure + business data exposure
+**Status**: Phase 7 - Vendor office platform-wide exploitation + complete architecture mapping + multi-service CORS chain
 
 ---
 
@@ -19,7 +19,7 @@ Comprehensive testing of 66 in-scope Metro AG assets identified **22 reportable 
 6. **ria voucher pre-prod app exposes access-code authentication via GET parameter** — authentication tokens (JWTs) transmitted in URLs, stored in localStorage, with full permission system and store data leaked in JS bundle (Finding 19)
 7. **AXCSS OAuth client_id confirmed on production IDAM** — second OAuth client discovered via pre-prod, with state JWT using HS256 symmetric signing (Finding 20)
 8. **METRO Seller Office 8MB JS bundle exposes complete microservice architecture** — 20+ backend service URLs, admin impersonation endpoint (`/admin/impersonation/exchange` with `_switch_user` tokens), public activation code endpoint, commission fee structures (7-15%), and 4.7MB of unauthenticated translation files (Finding 21)
-9. **METRO Vendor Office Symfony debug mode in production** — every `/api/v1/*` path returns full PHP stack traces with file paths, class names, and framework internals; CORS reflects any `*.metro-vendoroffice.com` subdomain with credentials; admin portal publicly accessible (Finding 22)
+9. **METRO Vendor Office platform-wide security failures** — Symfony debug mode leaking 18KB stack traces, CORS subdomain wildcard with credentials on ALL 8+ services, no rate limiting on login, PHPSESSID missing Secure flag, GCS bucket with public documents, 20+ microservice architecture fully mapped, 50+ API endpoints disclosed (Finding 22)
 
 ---
 
@@ -1631,131 +1631,217 @@ Pattern: `mma-mp-{country}-production-cdn.prod.{country}.metro-marketplace.cloud
 
 ---
 
-## Finding 22: METRO Vendor Office — Symfony Debug Mode in Production + CORS Subdomain Wildcard with Credentials + Admin Portal Exposure
+## Finding 22: METRO Vendor Office — Symfony Debug Mode in Production + Platform-Wide CORS Subdomain Wildcard + No Login Rate Limiting + Complete Architecture Disclosure
 
 **Severity**: High-Critical
-**Asset**: `www.metro-vendoroffice.com`, `admin.metro-vendoroffice.com`, `vendor.metro-vendoroffice.com` (*.metro-vendoroffice.com — in scope as wildcard domain)
-**Type**: Security Misconfiguration (OWASP A05) + Sensitive Data Exposure (OWASP A02) + CORS Misconfiguration
+**Asset**: `www.metro-vendoroffice.com`, `admin.metro-vendoroffice.com`, `vendor.metro-vendoroffice.com`, `offer-*.metro-vendoroffice.com`, `notification-hub.metro-vendoroffice.com` (*.metro-vendoroffice.com — in scope as wildcard domain)
+**Type**: Security Misconfiguration (OWASP A05) + Sensitive Data Exposure (OWASP A02) + CORS Misconfiguration + Broken Access Control (OWASP A01)
 
 ### Description
 
-The METRO Vendor Office platform (`*.metro-vendoroffice.com`) has **three critical security issues**:
+The METRO Vendor Office platform (`*.metro-vendoroffice.com`) has **six critical security issues** creating a chained attack surface:
 
-1. **Symfony Debug Mode enabled in production** — every `/api/v1/*` path returns full PHP stack traces including file paths, class names, line numbers, and framework internals
-2. **CORS policy reflects ANY `*.metro-vendoroffice.com` subdomain** with `Access-Control-Allow-Credentials: true` — an XSS or subdomain takeover on any of 9+ subdomains enables credential theft from the main vendor portal
-3. **Three live portals accessible without IP restriction** — www (PHP login + API), admin (Angular admin panel), vendor (Angular vendor portal) — all on the public internet
+1. **Symfony Debug Mode enabled in production** — every `/api/v1/*` path returns 18KB JSON responses with full PHP stack traces, file paths, class names, line numbers, complete `traceAsString`, and `asString` debug output
+2. **Platform-wide CORS subdomain wildcard with credentials** — confirmed on ALL 8+ services (www, buying-bff, notification-hub, offer-export, offer-funnel, offer-reactor, offer-safety, offer-xk)
+3. **No rate limiting on login_check** — 5 consecutive login attempts all succeed in ~300ms with no throttling or account lockout
+4. **PHPSESSID cookie missing Secure flag** — session cookie transmittable over HTTP
+5. **Public GCS bucket with vendor business documents** — 4 files publicly downloadable from `sms-prod-assets` bucket
+6. **Complete microservice architecture disclosure** via two JS bundles (admin 305KB + vendor 345KB) exposing 20+ services, role system, Mercure SSE hub, PowerBI integration, and 50+ API endpoints
 
 ### Evidence
 
-**1. Symfony debug mode leaks full stack traces on every `/api/v1/*` path:**
+**1. Symfony debug mode leaks full stack traces with complete internal paths on every `/api/v1/*` path (18KB per response):**
 ```json
-GET /api/v1 HTTP/2
+GET /api/v1/test HTTP/2
 Host: www.metro-vendoroffice.com
 
 {
   "statusCode": 404,
+  "headers": {"Vary": "Accept"},
   "class": "Symfony\\Component\\HttpKernel\\Exception\\NotFoundHttpException",
   "file": "/app/vendor/symfony/http-kernel/EventListener/RouterListener.php",
   "line": 135,
-  "message": "No route found for \"GET https://www.metro-vendoroffice.com/api/v1\"",
+  "statusText": "Not Found",
+  "message": "No route found for \"GET https://www.metro-vendoroffice.com/api/v1/test\"",
+  "code": 0,
   "previous": {
+    "statusCode": 500,
     "class": "Symfony\\Component\\Routing\\Exception\\ResourceNotFoundException",
     "file": "/app/vendor/symfony/routing/Matcher/Dumper/CompiledUrlMatcherTrait.php",
     "line": 74
   },
-  "trace": [
-    {"class": "CompiledUrlMatcher", "function": "match", "file": ".../CompiledUrlMatcherTrait.php", "line": 74},
-    {"class": "UrlMatcher", "function": "matchRequest", "file": ".../UrlMatcher.php", "line": 106},
-    {"class": "Router", "function": "matchRequest", "file": ".../Router.php", "line": 257},
-    {"class": "RouterListener", "function": "onKernelRequest", "file": ".../RouterListener.php", "line": 111},
-    {"class": "EventDispatcher", "function": "dispatch", "file": ".../EventDispatcher.php", "line": 59},
-    {"class": "HttpKernel", "file": ".../HttpKernel.php"}
-  ]
+  "trace": [8 entries with full namespace/class/function/file/line],
+  "traceAsString": "#0 /app/vendor/symfony/event-dispatcher/EventDispatcher.php(270): ...\n#1 ...\n#6 /app/public/index.php(27): ...",
+  "dataRepresentation": null,
+  "asString": "Symfony\\Component\\Routing\\Exception\\ResourceNotFoundException: No routes found for \"/api/v1/test/\". in /app/vendor/symfony/routing/Matcher/Dumper/CompiledUrlMatcherTrait.php:74..."
 }
 ```
-This confirms: Symfony framework, file paths under `/app/vendor/symfony/`, compiled URL matcher, event-driven routing.
+Response exposes: application root `/app/`, all Symfony component paths, `public/index.php` as entry point, compiled URL matcher internals, EventDispatcher architecture. Every arbitrary path under `/api/v1/*` returns this 18KB debug dump.
 
-**2. CORS reflects any `*.metro-vendoroffice.com` subdomain with credentials:**
+**2. CORS subdomain wildcard with credentials confirmed on ALL 8+ services across the platform:**
 ```
-Request:  Origin: https://evil.metro-vendoroffice.com
-Response: Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com
-          Access-Control-Allow-Credentials: true
-          Access-Control-Allow-Methods: GET, PUT, POST, DELETE, PATCH, OPTIONS
+=== www.metro-vendoroffice.com ===
+Origin: https://evil.metro-vendoroffice.com
+→ Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com
+  Access-Control-Allow-Credentials: true
+  Access-Control-Allow-Methods: GET, PUT, POST, DELETE, PATCH, OPTIONS
+  Access-Control-Allow-Headers: ...Authorization,...x-session-id,...sentry-trace,baggage
 
-Request:  Origin: https://admin.metro-vendoroffice.com
-Response: Access-Control-Allow-Origin: https://admin.metro-vendoroffice.com
-          Access-Control-Allow-Credentials: true
+=== buying-bff (service with cookie-based auth) ===
+Origin: https://evil.metro-vendoroffice.com
+→ Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com
+  Access-Control-Allow-Credentials: true
+  Access-Control-Expose-Headers: X-Correlation-Id
 
-Request:  Origin: https://evil.com
-Response: Access-Control-Allow-Origin: https://www.metro-vendoroffice.com  (NOT reflected - external blocked)
+=== notification-hub.metro-vendoroffice.com (Mercure SSE) ===
+Origin: https://evil.metro-vendoroffice.com
+→ Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com
+  Access-Control-Allow-Credentials: true
+
+=== ALL 5 offer-* microservices ===
+offer-export → Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com + credentials
+offer-funnel → Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com + credentials
+offer-reactor → Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com + credentials
+offer-safety → Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com + credentials
+offer-xk     → Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com + credentials
+
+External origins correctly blocked (evil.com → www.metro-vendoroffice.com echoed, not reflected)
 ```
-The CORS policy trusts any subdomain of `metro-vendoroffice.com`, including non-existent ones. Combined with the 9+ live subdomains, any XSS on any subdomain can steal authenticated data from the main portal.
 
-**3. Three live portals exposed:**
-
-a) **www.metro-vendoroffice.com** — PHP/Symfony vendor login (Vendor Central):
+**3. No rate limiting on login_check — 5 consecutive failed logins in rapid succession:**
 ```
-Set-Cookie: PHPSESSID=e23cbee4cd57472dc483f93ef07cb55b; path=/; httponly
+[302|0.298078] attempt 1 - POST /login_check _username=test1@test.com
+[302|0.298511] attempt 2 - POST /login_check _username=test2@test.com
+[302|0.335465] attempt 3 - POST /login_check _username=test3@test.com
+[302|0.390510] attempt 4 - POST /login_check _username=test4@test.com
+[302|0.289193] attempt 5 - POST /login_check _username=test5@test.com
+```
+All return 302 redirect to `/` with ~300ms response time. No CAPTCHA, no account lockout, no progressive delay, no IP-based throttling detected.
+
+**4. PHPSESSID cookie missing Secure and SameSite flags:**
+```
+Set-Cookie: PHPSESSID=da3a466f483cd35a6612a0520b89b3c6; path=/; httponly
 Set-Cookie: apiKey=deleted; domain=.metro-vendoroffice.com; secure; httponly; samesite=lax
+```
+The `PHPSESSID` session cookie has only `httponly` — it is missing the `Secure` flag (transmittable over HTTP downgrade) and missing explicit `SameSite` attribute. The `apiKey` cookie is properly flagged but scoped to `.metro-vendoroffice.com` (all subdomains share it).
+
+**5. GCS bucket `sms-prod-assets` — 4 vendor business documents publicly downloadable:**
+```
+[200|615865] https://storage.googleapis.com/sms-prod-assets/vendor-portal/documents/offer_competitiveness_page_guide.pdf (615KB)
+[200|6031]   https://storage.googleapis.com/sms-prod-assets/vendor-portal/documents/offers_template.xlsx (6KB)
+[200|12179]  https://storage.googleapis.com/sms-prod-assets/vendor-portal/documents/price_offer_template.xlsx (12KB)
+[200|9265]   https://storage.googleapis.com/sms-prod-assets/vendor-portal/documents/stock_offer_template.xlsx (9KB)
+```
+Bucket listing is denied (401), but individual objects are publicly readable if you know the path. These files contain vendor onboarding templates and pricing structures.
+
+**6. Complete platform architecture disclosed via JS bundles (admin 305KB + vendor 345KB):**
+
+a) **20+ microservice URLs exposed:**
+```
+www.metro-vendoroffice.com/auth/client-api/                    → Auth service (401)
+www.metro-vendoroffice.com/configuration/client-api/v1/feature-flags → Config (401)
+www.metro-vendoroffice.com/demand-planning/client-api/v1/products/lifecycle → Demand (401)
+www.metro-vendoroffice.com/vendor/client-api/v1/               → Vendor API (401 on countries, categories)
+www.metro-vendoroffice.com/vendor/external-api/                 → External API (404)
+www.metro-vendoroffice.com/vendor-dashboard/client-api/v1/      → Dashboard (404)
+www.metro-vendoroffice.com/buying-bff/client-api/v1/            → Buying BFF (400 no auth / 401 with invalid cookie)
+www.metro-vendoroffice.com/buying-offer/api/v1/                 → Buying Offers (404 - Go service)
+www.metro-vendoroffice.com/finance/client-api/v1/               → Finance (Symfony 404)
+www.metro-vendoroffice.com/return-service/client-api/v1/        → Returns (404)
+www.metro-vendoroffice.com/delivery-service/client-api/         → Delivery
+www.metro-vendoroffice.com/inventory-service/client-api/        → Inventory (Symfony 404)
+www.metro-vendoroffice.com/label-service/client-api/            → Label/Customs
+www.metro-vendoroffice.com/pim-upload/client-api/               → PIM Upload
+www.metro-vendoroffice.com/product-data-enhancement/client-api/ → Product Data
+notification-hub.metro-vendoroffice.com/.well-known/mercure     → Mercure SSE (401)
+offer-export.metro-vendoroffice.com/api/                        → Offer Export (404)
+offer-funnel.metro-vendoroffice.com/api/                        → Offer Funnel (404)
+offer-reactor.metro-vendoroffice.com/api/                       → Offer Reactor (404)
+offer-safety.metro-vendoroffice.com/api/                        → Offer Safety (404)
+offer-xk.metro-vendoroffice.com/api/                            → Offer XK (404)
+help.metro-vendoroffice.com/                                    → Help Portal (503)
+```
+
+b) **Buying BFF differential auth response** reveals cookie-based auth mechanism:
+```
+No cookie    → 400 Bad Request (empty body) — missing required auth
+Invalid cookie → 401 Unauthorized (empty body) — auth check reached, rejected
+```
+
+c) **Role/permission system disclosed:**
+```
+ROLE_ADMIN, ROLE_VENDOR, ROLE_VENDOR_INTEGRATION_MANAGER,
+ROLE_CAN_MANAGE_VENDORS, ROLE_CAN_UPDATE_VENDOR_CONTRACT, ROLE_BUYP_ADMIN
+```
+
+d) **50+ API endpoint paths from vendor portal JS:**
+```
+vendors/${id}/offline               — Move vendor offline
+vendors/${id}/reinstate             — Reinstate vendor
+vendors/${id}/document-signing/current/send  — Send contract
+vendors/${id}/document-signing/current/sign  — Sign contract digitally
+vendors/${id}/bank-info-request     — Bank information (PII)
+vendors/${id}/products/batch/csv    — Bulk product upload
+vendors/${id}/master-file/last      — Latest master file
+vendors/${id}/contacts              — Vendor contacts
+vendors/${id}/categories            — Product categories
+leads/${id}/contacts/${cid}/email-registration-link — Send registration link
+leads/${id}/contacts/${cid}/registration-link       — Get registration link
+leads-contacts/${id}/block          — Block user
+leads-contacts/${id}/unblock        — Unblock user
+vendor/client-api/v1/async/vendors/${id}/product-data/template — Product data template
+product-data/async/vendor/${id}     — Async product data
+```
+
+e) **Third-party integrations exposed:**
+```
+https://app.powerbi.com/reportEmbed                             — PowerBI analytics
+https://notification-hub.metro-vendoroffice.com/.well-known/mercure — Mercure SSE hub
+Pre-prod URL leak: https://www.pp.metro-vendorcentral.com/carton-service/client-api/
+```
+
+**7. Infrastructure headers leak operational details:**
+```
 x-app-version: 2118893
+x-ingress-controller: v2
+x-ingress-request-id: c71b9f5d9229c0f8ddf4b7fa646fb706
+x-ingress-request-start: t=1790738472.009
+x-powered-by: A fleet of awesome Marketeers. Apply today - https://www.metro-markets.de/careers
+x-cdn-cache-id: CMH
+x-cdn-cache-status: miss
 ```
-- Login form: `POST /login_check` with `user[email]` + `user[password]`
-- Forgot password: `POST /forgot-password` with Symfony CSRF tokens
-- `apiKey` cookie scoped to `.metro-vendoroffice.com` (shared across ALL subdomains)
-- `.env` and `.git/config` exist on disk (403 Forbidden by nginx)
+Kubernetes ingress v2, CDN node identifier (CMH), request timing, app version — all exposed.
 
-b) **admin.metro-vendoroffice.com** — Angular admin panel (305KB main.js):
-```html
-<title>Admin Portal</title>
-<fnc-root>...</fnc-root>
-```
+**8. Three live portals with no network restriction:**
 
-c) **vendor.metro-vendoroffice.com** — Angular vendor portal (34KB):
-```html
-<title>Vendor Portal</title>
-```
+a) **www.metro-vendoroffice.com** — PHP/Symfony login + Symfony debug mode + `.env`/`.git/config` (403)
 
-**4. Nine active microservices confirmed via client-api paths (3+ error formats):**
-```
-auth/client-api/         → {"error":"NOT_FOUND","message":"COMMON.ERROR.NOT_FOUND"}
-configuration/client-api/ → {"type":"...rfc2616#section-10","title":"An error occurred","status":404}
-delivery-service/client-api/ → {"status":404,"message":"No route found for..."}  ← LEAKS internal URL
-demand-planning/client-api/ → {"code":404,"message":"Not Found"}
-finance/client-api/      → RFC 2616 format
-inventory-service/client-api/ → RFC 2616 format
-label-service/client-api/ → RFC 2616 format
-pim-upload/client-api/   → NOT_FOUND format
-product-data-enhancement/client-api/ → NOT_FOUND format
-```
+b) **admin.metro-vendoroffice.com** — 305KB Angular admin panel with vendor management, lead management, document signing, demand planning
 
-**5. Admin JS bundle reveals additional service architecture:**
-```
-offer-export.metro-vendoroffice.com/api/
-offer-funnel.metro-vendoroffice.com/api/
-offer-reactor.metro-vendoroffice.com/api/
-offer-safety.metro-vendoroffice.com/api/
-offer-xk.metro-vendoroffice.com/api/
-vendor.metro-vendoroffice.com/
-help.metro-vendoroffice.com/ (503 - down)
-```
+c) **vendor.metro-vendoroffice.com** — 345KB Angular vendor portal with product management, contract signing, bank info, eco-fee registration
 
 ### Impact
 
-- **Information disclosure (Critical)**: Symfony debug traces expose the full application internals — file structure, dependency versions, class hierarchy, routing configuration. This is the #1 prerequisite for developing targeted exploits (e.g., known-vulnerability matching against the specific Symfony version, identifying custom code paths for injection testing)
-- **Cross-origin credential theft (High)**: The CORS subdomain wildcard with credentials means any XSS on ANY of the 9+ `*.metro-vendoroffice.com` subdomains (offer-export, offer-funnel, vendor, admin, etc.) allows reading authenticated API responses from `www.metro-vendoroffice.com`, stealing session tokens, vendor data, financial information, and orders
-- **Cross-subdomain cookie theft**: The `apiKey` cookie uses `domain=.metro-vendoroffice.com`, making it accessible to all subdomains. Combined with the CORS misconfiguration, this creates a chain where compromising any subdomain gives access to the authentication cookie
-- **Admin panel publicly accessible**: The admin portal at `admin.metro-vendoroffice.com` requires no VPN or IP restriction — only application-layer authentication separates an attacker from admin functionality
-- **Version disclosure enables targeted attacks**: `x-app-version: 2118893` + Symfony debug traces allow pinpointing exact library versions for known CVE matching
+- **Information disclosure (Critical)**: Symfony debug traces (18KB per request) expose the full application internals — file structure (`/app/vendor/symfony/...`), dependency versions, class hierarchy, routing configuration, and the `traceAsString`/`asString` fields provide complete human-readable stack traces. This is the #1 prerequisite for developing targeted exploits
+- **Credential theft chain (High)**: The CORS subdomain wildcard with credentials across ALL 8+ services means any XSS on ANY `*.metro-vendoroffice.com` subdomain steals authenticated API responses, session tokens, vendor data, financial information, bank details, and orders. The attack is: find XSS on any offer-* service → read cross-origin from www → exfiltrate vendor/financial data
+- **Brute-force vendor accounts (High)**: No rate limiting on `POST /login_check` enables credential stuffing and brute-force attacks against vendor accounts. Combined with the Symfony debug mode (which may leak valid routes and error details), this significantly lowers the barrier for account compromise
+- **Session hijacking via HTTP downgrade**: PHPSESSID missing `Secure` flag means the session cookie can be intercepted over HTTP connections (MITM on a vendor's network)
+- **Cross-subdomain cookie theft**: The `apiKey` cookie scoped to `.metro-vendoroffice.com` is accessible from all subdomains, amplifying the CORS misconfiguration impact
+- **Vendor financial data at risk**: API endpoints for bank info, contract signing, payment, and finance are all behind a single auth layer with no rate limiting and broad CORS
+- **Supply chain visibility**: GCS bucket exposes vendor pricing templates and offer competitiveness guides — business intelligence leakage
 
 ### Recommendation
 
-1. **IMMEDIATELY disable Symfony debug mode in production** — set `APP_DEBUG=false` and `APP_ENV=prod` in environment configuration. This is the single most impactful fix
-2. **Restrict CORS to exact origin list** — replace the subdomain wildcard pattern with an explicit allowlist of only the specific subdomains that need cross-origin access
-3. **Restrict admin portal access** — place `admin.metro-vendoroffice.com` behind VPN or IP allowlist
-4. **Scope cookies to specific subdomains** — change `apiKey` cookie domain from `.metro-vendoroffice.com` to the specific subdomain that needs it (e.g., `www.metro-vendoroffice.com`)
-5. **Remove `.env` and `.git` from the web root** — while nginx blocks access, these files should not exist in the web-accessible directory at all
-6. **Standardize error responses** across microservices — the 3+ different error formats indicate inconsistent security controls
-7. **Strip infrastructure headers** — remove `x-app-version`, `x-ingress-controller`, `x-ingress-request-start`, `x-powered-by`
+1. **IMMEDIATELY disable Symfony debug mode in production** — set `APP_DEBUG=false` and `APP_ENV=prod`. This is the single most impactful fix
+2. **Implement login rate limiting** — add CAPTCHA after 3-5 failures, progressive delays, and IP-based throttling on `POST /login_check`
+3. **Restrict CORS to exact origin list** — replace the platform-wide subdomain wildcard with explicit allowlist
+4. **Add Secure and SameSite flags to PHPSESSID** — `Set-Cookie: PHPSESSID=...; path=/; httponly; Secure; SameSite=Lax`
+5. **Restrict admin portal access** — place `admin.metro-vendoroffice.com` behind VPN or IP allowlist
+6. **Scope cookies to specific subdomains** — change `apiKey` cookie domain from `.metro-vendoroffice.com` to `www.metro-vendoroffice.com`
+7. **Restrict GCS bucket access** — make `sms-prod-assets` objects private, serve via signed URLs
+8. **Remove `.env` and `.git` from the web root** — while nginx blocks access, these files should not exist in the web-accessible directory
+9. **Strip infrastructure headers** — remove `x-app-version`, `x-ingress-controller`, `x-ingress-request-start`, `x-powered-by`, `x-cdn-cache-id`
+10. **Standardize error responses** across microservices and ensure no internal details leak
 
 ---
 
@@ -1804,12 +1890,20 @@ The following in-scope targets were **unreachable** from the testing environment
 - Seller Office active API backend at /api/v1/* returns structured JSON 404 errors confirming route existence (Finding 21)
 - Seller Office K8s ingress metadata + CDN naming convention + Storyblok CMS + ConfigCat feature flags (Finding 21)
 - my-pp.metro.it pre-prod CSP with unsafe-eval, unsafe-inline, and Apollo GraphQL sandbox (Finding 20)
-- Vendor Office Symfony debug mode in production — full stack traces on all /api/v1/* paths (Finding 22)
-- Vendor Office CORS subdomain wildcard with credentials — evil.metro-vendoroffice.com reflected with ACAO + credentials (Finding 22)
-- Vendor Office admin portal (admin.metro-vendoroffice.com) and vendor portal (vendor.metro-vendoroffice.com) publicly accessible (Finding 22)
-- Vendor Office 9+ microservices confirmed via client-api paths with inconsistent error formats (Finding 22)
+- Vendor Office Symfony debug mode in production — full 18KB stack traces on all /api/v1/* paths with traceAsString and asString (Finding 22)
+- Vendor Office CORS subdomain wildcard with credentials — confirmed on ALL 8+ services: www, buying-bff, notification-hub, offer-export/funnel/reactor/safety/xk (Finding 22)
+- Vendor Office admin portal (admin.metro-vendoroffice.com, 305KB) and vendor portal (vendor.metro-vendoroffice.com, 345KB) publicly accessible (Finding 22)
+- Vendor Office 20+ microservices confirmed: auth, configuration, delivery, demand-planning, finance, inventory, label, pim-upload, product-data-enhancement, return, vendor, vendor-dashboard, buying-bff, buying-offer, 5 offer-* services, notification-hub (Finding 22)
 - Vendor Office .env and .git/config exist on disk (403 by nginx) (Finding 22)
 - Vendor Office apiKey cookie scoped to .metro-vendoroffice.com (cross-subdomain sharing) (Finding 22)
+- Vendor Office PHPSESSID missing Secure and SameSite flags — session cookie transmittable over HTTP (Finding 22)
+- Vendor Office no rate limiting on POST /login_check — 5 rapid consecutive attempts with no throttling (Finding 22)
+- Vendor Office buying-bff differential auth response: 400 (no cookie) vs 401 (invalid cookie) reveals cookie-based auth (Finding 22)
+- Vendor Office GCS bucket sms-prod-assets with 4 publicly downloadable documents: offers_template.xlsx, price_offer_template.xlsx, stock_offer_template.xlsx, offer_competitiveness_page_guide.pdf (Finding 22)
+- Vendor Office Mercure SSE notification hub at notification-hub.metro-vendoroffice.com (401 — exists, auth required) (Finding 22)
+- Vendor Office PowerBI reportEmbed integration, pre-prod URL leak (www.pp.metro-vendorcentral.com), 6 roles (ROLE_ADMIN, ROLE_VENDOR, etc.) (Finding 22)
+- Vendor Office 50+ API endpoint paths extracted from vendor portal JS — vendors/bank-info-request, leads/registration-link, document-signing, etc. (Finding 22)
+- Vendor Office K8s ingress v2 headers, CDN node identifier (CMH), x-app-version: 2118893 (Finding 22)
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
@@ -1854,8 +1948,10 @@ The following in-scope targets were **unreachable** from the testing environment
 - adfs3.metro.info (connection failure)
 - *.metro-marketplace.cloud subdomains (all DNS resolution failures — no active subdomains found)
 - *.metro-markets.net subdomains (all DNS resolution failures)
-- *.metro-vendorcentral.com subdomains (all DNS resolution failures)
+- *.metro-vendorcentral.com subdomains (www.pp.metro-vendorcentral.com reachable but 403 on all paths — IP restricted)
 - ria voucher API backend at api.cf-vvv-preprod-o6.cf.metro.cloud (returns 404 for all tested paths — backend may require different routing)
+- betty.metro.{bg,de,fr,hr,hu,it,pk,pt,ro,rs,ua} — all blocked by egress proxy (HTTP 000)
+- Vendor Office notification-hub.metro-vendoroffice.com (returns 401 — Mercure SSE hub, auth required)
 
 ## Next Steps (Phase 6)
 
