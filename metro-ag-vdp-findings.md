@@ -2139,7 +2139,36 @@ HTTP/2 500
 
 Leaks Symfony exception class names (`NotFoundHttpException`) and internal URLs in error messages — identical pattern to Finding 22's vendor office Symfony debug mode.
 
-#### 9. Permissive CSP
+#### 9. Three Additional Services with Unauthenticated OpenAPI Specs
+
+| Service | Spec URL | Endpoints | Schemas |
+|---------|----------|-----------|---------|
+| service-seller-gateway | `/api/v1/api-doc` | 22 (order mgmt, KPIs, carrier) | 25 |
+| app-seller-pim | `/api/v1/api-doc` | 12 (products, uploads, CSV template) | 13 |
+| service-category | `/api/v1/api-doc` | 13 (categories, attributes, brands) | 32 |
+
+**Total: 47 endpoints + 70 schemas exposed across 3 services without authentication.**
+
+The PIM spec reveals `SecurityToken` schema with `access_token`, `refresh_token`, and `expires_in` fields — documenting the JWT auth flow. The upload endpoint accepts `multipart/form-data` with CSV file uploads for product processing.
+
+#### 10. Health/Self-Check Endpoints Leaking Infrastructure on 8+ Internal Services
+
+| Service | Endpoint | Status | Infrastructure Leaked |
+|---------|----------|--------|----------------------|
+| service-aftersales-v2 | `/api/v1/auth/app-check/test` | 200 | `it works!` |
+| service-seller-gateway | `/api/v1/auth/app-check/health` | 200 | `service-seller-gateway is ready.` |
+| app-seller-pim | `/api/v1/auth/app-check/self` | 200 | Redis OK, **MongoDB FAIL** (doctrine_mongodb.odm.default_connection), filesystem, **PubSub FAIL** (topic: `upload_parsing`) |
+| app-seller-inventory | `/api/v1/auth/app-check/self` | 200 | Redis, Doctrine, **Elasticsearch**, **PubSub FAIL** (subscriptions: `org_offer_status_pausing`, `org_offer_status_unpausing`) |
+| service-category | `/api/v1/auth/app-check/self` | 200 | Doctrine ORM, PubSub, services |
+| service-multimarket-central | `/api/v1/auth/app-check/self` | 200 | Doctrine ORM, env vars, services |
+| service-refund-requests | `/api/v1/auth/app-check/self` | 200 | env vars, services |
+| service-payment-provider | `/api/v1/auth/app-check/health` | 200 | `service-payment-provider is ready.` |
+| service-payment-reports | `/api/v1/auth/app-check/health` | 200 | `{"status":"ok"}` |
+| app-seller-price-competitiveness | `/api/v1/auth/app-check/health` | 200 | `{"message":"ok"}` |
+
+**Critical leaks:** The PIM self-check reveals MongoDB via Doctrine ODM and PubSub topic names. The inventory self-check reveals Redis, Doctrine ORM, Elasticsearch, and PubSub subscription names (`org_offer_status_pausing`, `org_offer_status_unpausing`). Two services show PubSub connection failures in production.
+
+#### 11. Permissive CSP
 
 ```
 content-security-policy: default-src 'self' http: https: data: blob: 'unsafe-inline'
@@ -2147,7 +2176,7 @@ content-security-policy: default-src 'self' http: https: data: blob: 'unsafe-inl
 
 This CSP provides essentially no protection — it allows all HTTP/HTTPS sources, inline scripts, data URIs, and blob URLs. XSS payloads execute without CSP interference.
 
-#### 10. Infrastructure Headers
+#### 12. Infrastructure Headers
 
 ```
 x-ingress-controller: v2
@@ -2161,11 +2190,12 @@ x-frame-options: SAMEORIGIN
 ### Impact
 
 - **Information Disclosure (Critical)**: Unauthenticated access to the complete microservice architecture — 21 internal service URLs, employee backoffice URL, Sentry DSN, SDK keys, feature flags, and METRO seller UUID
-- **Expanded Attack Surface**: All 21 internal services are accessible from the internet, bypassing intended service mesh isolation. An attacker can probe each service directly for vulnerabilities. The seller-gateway provides a complete OpenAPI spec with 22 endpoints and 25 data schemas, fully documenting the API attack surface
+- **Expanded Attack Surface**: All 21 internal services are accessible from the internet, bypassing intended service mesh isolation. Three services (seller-gateway, app-seller-pim, service-category) expose complete OpenAPI/Swagger specs totaling 47 endpoints and 70 data schemas, fully documenting the API attack surface including request/response formats, parameter types, and data models
 - **Debug Mode in Production**: Laravel Debugbar routes are defined in the application (route map exposed via Ziggy), meaning debug tooling was enabled during deployment. The `_debugbar/queries/explain` POST endpoint, if functional, enables arbitrary SQL EXPLAIN queries. The `_ignition/execute-solution` endpoint is a known RCE vector (CVE-2021-3129)
 - **Session Fixation Risk**: Sanctum CSRF cookie endpoint creates sessions for unauthenticated visitors; combined with wildcard CORS, any website can initiate sessions and make CSRF-protected requests
 - **Impersonation Feature Exposure**: The `X-Impersonation-Session-Id` CORS header confirms the existence of user impersonation functionality. Combined with the admin endpoints visible in the route map (`admin/sellers/organizations/{organizationId}`), this suggests full admin-level seller management capability
 - **Sentry DSN Abuse**: The exposed Sentry DSN (`d5cc4bbbb4f34303b91147f3b6c3c23a@cps-sentry.metro-markets.org/75`) allows an attacker to inject fake error reports into METRO's error monitoring, potentially flooding dashboards or injecting malicious content into error messages viewed by developers
+- **Health/Self-Check Infrastructure Disclosure**: 8+ services expose `/api/v1/auth/app-check/self` or `/health` endpoints revealing backend technology stack (MongoDB, Redis, Elasticsearch, Doctrine ORM, PubSub), connection status, topic names, and subscription names — all without authentication. Two services show PubSub connection failures in production
 
 ### CVSS Assessment
 
