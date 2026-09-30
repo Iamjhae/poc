@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 9 - IDAM OAuth platform-wide misconfigurations + shop platform configuration exposure
+**Status**: Phase 10 - ServiceNow instance information disclosure + admin portal exposure
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **25 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **27 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -2613,7 +2613,215 @@ These UUIDs could enable IDOR attacks against store-specific APIs.
 
 ---
 
-## Next Steps (Phase 9)
+## Finding 26: Admin Portal Publicly Accessible — Exposes 30 Internal Roles and 20+ Backend Microservice URLs
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `admin.metro-vendoroffice.com` (*.metro-vendoroffice.com — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Information Disclosure
+
+### Description
+
+The production admin panel for MetroMarkets Vendor Office is publicly accessible at `admin.metro-vendoroffice.com`. While login is required for functional access, the Angular SPA's main JavaScript bundle (305KB) is served unauthenticated and exposes the complete internal role-based access control model (30 admin roles) and 20+ backend microservice URLs — information that would normally only be available to authenticated administrators.
+
+### Evidence
+
+**Admin portal accessible without authentication:**
+```
+GET / HTTP/2
+Host: admin.metro-vendoroffice.com
+
+200 OK
+Content-Type: text/html; charset=utf-8
+```
+
+The HTML page title confirms: `<title>MetroMarkets: Admin Portal</title>`
+
+**30 admin roles exposed in main.js bundle:**
+```javascript
+ROLE_ADMIN
+ROLE_CAN_EXPORT_PAYMENTS
+ROLE_CAN_MANAGE_ACCOUNTING_PERIOD
+ROLE_CAN_MANAGE_CUSTOMER_REQUESTS
+ROLE_CAN_MANAGE_ERP_ATTRIBUTES
+ROLE_CAN_MANAGE_FINANCE_REPORTS
+ROLE_CAN_MANAGE_INTRASTAT
+ROLE_CAN_MANAGE_INVENTORIES
+ROLE_CAN_MANAGE_IWT_INVOICES
+ROLE_CAN_MANAGE_VENDOR_INVOICES
+ROLE_CAN_MANAGE_VENDOR_SETTINGS
+ROLE_CAN_VIEW_ACCOUNTS_PAYABLE
+ROLE_CAN_VIEW_BANKING_REQUESTS
+ROLE_CAN_VIEW_BUYER_INVOICES
+ROLE_CAN_VIEW_BUYER_NOTES
+ROLE_CAN_VIEW_CUSTOMS_DOCUMENTS
+ROLE_CAN_VIEW_FAILED_MESSAGES
+ROLE_CAN_VIEW_FORDERS
+ROLE_CAN_VIEW_GR_HEADERS
+ROLE_CAN_VIEW_INVUNITS
+ROLE_CAN_VIEW_IWT_INVOICES
+ROLE_CAN_VIEW_MCOM
+ROLE_CAN_VIEW_PAYMENTS
+ROLE_CAN_VIEW_RETURNS_LIST
+ROLE_CAN_VIEW_RETURN_DETAIL
+ROLE_CAN_VIEW_SALE_ORDERS
+ROLE_CAN_VIEW_VENDORS
+ROLE_CAN_VIEW_VENDOR_BALANCES
+ROLE_CAN_VIEW_VENDOR_INVOICES
+ROLE_VENDOR
+```
+
+**20+ backend microservice URLs disclosed:**
+```
+https://offer-export.metro-vendoroffice.com
+https://offer-funnel.metro-vendoroffice.com
+https://offer-reactor.metro-vendoroffice.com
+https://offer-safety.metro-vendoroffice.com
+https://offer-xk.metro-vendoroffice.com
+https://www.metro-vendoroffice.com/auth/client-api/
+https://www.metro-vendoroffice.com/configuration/client-api/
+https://www.metro-vendoroffice.com/delivery-service/client-api/
+https://www.metro-vendoroffice.com/demand-planning/client-api/
+https://www.metro-vendoroffice.com/finance/client-api/
+https://www.metro-vendoroffice.com/inventory-service/client-api/
+https://www.metro-vendoroffice.com/label-service/client-api/
+https://www.metro-vendoroffice.com/pim-upload/client-api/
+https://www.metro-vendoroffice.com/product-data-enhancement/client-api/
+https://www.metro-vendoroffice.com/return-service/client-api/
+https://www.metro-vendoroffice.com/translation-service/client-api/
+```
+
+All offer-* subdomains resolve and respond with JSON 404s (confirming they are live microservices), each with unique `x-app-version` values and the shared cookie domain `.metro-vendoroffice.com`.
+
+**All 5 offer-* microservices confirmed live:**
+```
+offer-export:  x-app-version: 36419775514
+offer-funnel:  x-app-version: 36419789570
+offer-reactor: x-app-version: 36419815432
+offer-safety:  x-app-version: 36419826826
+offer-xk:     x-app-version: 36419837352
+```
+
+### Impact
+
+- **Privilege escalation roadmap**: The 30 role names reveal the complete admin RBAC model, enabling targeted privilege escalation testing (BFLA attacks against `ROLE_ADMIN`, `ROLE_CAN_EXPORT_PAYMENTS`, `ROLE_CAN_MANAGE_FINANCE_REPORTS`)
+- **Attack surface mapping**: 20+ production microservice URLs provide a complete backend architecture map for targeted API attacks
+- **Financial data targeting**: Roles like `ROLE_CAN_EXPORT_PAYMENTS`, `ROLE_CAN_VIEW_ACCOUNTS_PAYABLE`, `ROLE_CAN_VIEW_VENDOR_BALANCES` indicate sensitive financial operations are accessible through this portal
+- **Business logic attacks**: Understanding of inventory, demand-planning, delivery, and return services enables business logic exploitation
+
+### Recommendation
+
+1. Restrict access to `admin.metro-vendoroffice.com` via IP allowlisting or VPN requirement
+2. Implement code splitting so that role constants and admin-specific routes are not included in the unauthenticated JS bundle
+3. Remove hardcoded microservice URLs from client-side code; use a server-side API gateway pattern
+4. Consider implementing a Web Application Firewall (WAF) rule to block access to JS source map files
+
+---
+
+## Finding 27: ServiceNow Instance Information Disclosure — stats.do and threads.do Publicly Accessible
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `metro.service-now.com` (metro.service-now.com — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Sensitive Data Exposure
+
+### Description
+
+The Metro AG ServiceNow instance at `metro.service-now.com` exposes multiple debug/diagnostic endpoints without authentication. The `stats.do` and `threads.do` endpoints reveal extensive production server internals including exact build versions, patch levels, Java runtime version, cluster topology, database connection pools, active session counts, memory allocation, and complete Java thread dumps with stack traces. Additionally, the Azure AD tenant ID is leaked in SAML SSO redirect URLs.
+
+### Evidence
+
+#### 27a. stats.do — Production Server Statistics (Unauthenticated)
+
+```
+GET /stats.do HTTP/1.1
+Host: metro.service-now.com
+
+200 OK — Full server statistics returned
+```
+
+**Leaked information includes:**
+
+| Category | Details |
+|----------|---------|
+| Cluster node | `metro038` |
+| Internal hostname | `app133069.bwi201.service-now.com:metro036` |
+| Build name | Zurich |
+| Build date | 09-23-2026_1515 |
+| Build tag | `glide-zurich-07-01-2025__patch10-hotfix4bw39-09-18-2026` |
+| Instance name | metro |
+| MID buildstamp | `zurich-07-01-2025__patch10-hotfix4bw39-09-18-2026_09-23-2026_1515` |
+| Memory | Max: 1963 MB, In use: 1618 MB (82% utilized) |
+| Transactions | 1,588,207 total, 370,056 errors (23% error rate) |
+| Active sessions | 8 logged in (33 active), max concurrency: 242 |
+| Session timeout | 90 minutes |
+| DB connection pools | 3 pools, 32 max connections each, with per-connection utilization stats |
+| Background scheduler | 8 workers, 1,165,222 total jobs processed |
+| Central scheduler node | `app133069.bwi201.service-now.com:metro036` |
+| Semaphore sets | Default, Debug, AMB_RECEIVE, TRINO_REST, AMB_SEND, API_INT, Presence |
+| API_INT rejections | 251 total max waiter rejections |
+
+#### 27b. threads.do — Java Thread Dump (Unauthenticated)
+
+```
+GET /threads.do HTTP/1.1
+Host: metro.service-now.com
+
+200 OK — Full Java thread dump returned
+```
+
+**Leaked information:**
+- Java version: `17.0.19`
+- Full stack traces for all running threads
+- Internal class names: `com.glide.worker.WorkerThread`, `com.glide.cluster.ClusterSynchronizer`
+- Apache Tomcat internals: `org.apache.tomcat.util.threads.ThreadPoolExecutor`
+- Cluster synchronizer details: `ClusterSynchronizer.java:252`
+
+#### 27c. Azure AD Tenant ID Leaked in SAML SSO Redirect
+
+The authentication redirect exposes the Azure AD tenant ID:
+```
+Location: /auth_redirect.do?sysparm_url=https://login.microsoftonline.com/
+  1c824dff-9735-475a-9bfa-a16070bc0fd6/saml2?SAMLRequest=...
+```
+
+**Azure AD Tenant ID**: `1c824dff-9735-475a-9bfa-a16070bc0fd6`
+
+#### 27d. Service Portal Guest Session Information
+
+The `/sp` service portal returns guest session details:
+```javascript
+window.NOW.session_id = '7C476D8B47638B108D258945D36D438F';
+window.NOW.user_name = 'guest';
+window.NOW.user_id = '5136503cc611227c0183e96598c4f706';
+window.NOW.user_display_name = 'Guest';
+```
+
+Additionally, portal and theme IDs are exposed:
+```
+portal_id = '81b75d3147032100ba13a5554ee4902b'
+theme_id = '79315153cb33310000f8d856634c9c4b'
+```
+
+### Impact
+
+- **Version-specific CVE targeting**: The exact build tag (`glide-zurich-07-01-2025__patch10-hotfix4bw39-09-18-2026`) enables attackers to identify unpatched vulnerabilities specific to this ServiceNow release
+- **Infrastructure reconnaissance**: Cluster node names, internal hostnames, and database pool configurations map the internal ServiceNow deployment architecture
+- **Capacity profiling**: Memory usage (82%), error rate (23%), and session counts enable attackers to plan resource-exhaustion attacks during high-utilization periods
+- **Azure AD enumeration**: The tenant ID enables further Azure AD reconnaissance (user enumeration, MFA bypass testing, token abuse)
+- **Java version targeting**: Java 17.0.19 version enables targeting known JRE vulnerabilities
+
+### Recommendation
+
+1. Restrict `stats.do` and `threads.do` to authenticated admin users only (ServiceNow ACL: `admin` role required)
+2. Configure the ServiceNow instance to block unauthenticated access to debug endpoints via Access Control Lists
+3. Consider enabling the ServiceNow "High Security" plugin which restricts these endpoints by default
+4. Review and rotate the Azure AD tenant configuration if it was intended to be internal-only
+5. Ensure the guest user ID is not reused across instances to prevent cross-instance correlation
+
+---
+
+## Next Steps (Phase 10)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
