@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 14 - Host header injection, WordPress exposure, continued deep probing
+**Status**: Phase 15 - Seller inventory microservice exposure, IDAM pre-prod OAuth, XML-RPC correction
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **36 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **38 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3467,7 +3467,7 @@ The Metro betty shop platform root path (`/`) blindly reflects a custom `Host` h
 
 ### Evidence
 
-**Confirmed on 5 domains spanning 4 countries + pre-prod:**
+**Confirmed on 14+ domains spanning 10+ countries + pre-prod:**
 
 ```bash
 # Germany (production)
@@ -3500,6 +3500,8 @@ HTTP/2 301
 location: https://evil.com:443/shop
 cache-control: private
 ```
+
+**Also confirmed on**: metromax.metro.hu, online.makro.pl, online.metro.rs, shop.metro.fr, shop.metro.md, shop.metro.ro, entregas.makro.pt, horecabezorgservice.makro.nl, livraison.metro.fr, mshop.metro-cc.hr (14+ domains total across DE, IT, TR, ES, UA, HU, PL, RS, FR, MD, RO, PT, NL, HR)
 
 **CRLF injection not possible** — the server strips CRLF sequences from the Host header.
 
@@ -3542,7 +3544,7 @@ The Metro Markets WordPress installation at `metro-markets.de` exposes multiple 
 
 1. **User enumeration via oembed**: The WordPress oembed API endpoint (`/wp-json/oembed/1.0/embed`) leaks author usernames, enabling targeted brute-force attacks
 2. **Author ID enumeration**: WordPress author archive pages confirm 12+ valid user accounts (IDs 2-13) via HTTP 301 redirects on `/?author=N`
-3. **XML-RPC enabled with system.multicall**: The `xmlrpc.php` endpoint is active and exposes `system.multicall`, which enables amplified brute-force attacks — a single HTTP request can test hundreds of username/password combinations simultaneously
+3. **XML-RPC enabled**: The `xmlrpc.php` endpoint is active with 3 methods exposed (`system.multicall`, `system.listMethods`, `system.getCapabilities`). While all WordPress-specific methods (e.g., `wp.getUsersBlogs`) are disabled (returning -32601), the XML-RPC interface itself remains accessible and could be leveraged if additional methods are re-enabled in the future
 4. **WP REST API namespace disclosure**: The `/wp-json/` endpoint reveals 16 API namespaces including plugin-specific routes (borlabs-cookie, SBR, yoast, wpml, duplicate-post), mapping the complete plugin landscape
 5. **Application passwords authentication enabled**: The REST API advertises `application-passwords` as an authentication method
 
@@ -3623,7 +3625,7 @@ Response:
 
 ### Impact
 
-- **Credential attacks**: Combined username enumeration (via oembed) with XML-RPC `system.multicall` enables efficient brute-force attacks against WordPress admin accounts — `system.multicall` can test 500+ password combinations per HTTP request, bypassing standard rate limiting
+- **Credential attacks**: Username enumeration via oembed and author archives exposes at least 12 valid accounts; if WordPress user-level XML-RPC methods are re-enabled, the existing `system.multicall` endpoint would immediately allow amplified brute-force attacks (currently mitigated by all wp.* methods being disabled)
 - **Plugin vulnerability targeting**: Exact version numbers for 10+ plugins allow attackers to search for known CVEs and exploit vulnerable plugin versions
 - **Account compromise preparation**: The `met001-s` username pattern suggests an internal naming convention (metro employee ID) — attackers can enumerate or predict additional usernames
 - **Application password abuse**: With application passwords enabled, a brute-forced password could be used to generate API-only authentication tokens without triggering 2FA
@@ -3639,12 +3641,187 @@ Response:
 
 ---
 
-## Next Steps (Phase 14)
+## Finding 37: Production Seller Inventory Microservice Directly Accessible with Wildcard CORS
 
-1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform
-2. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
-3. **Open redirect chaining with Finding 15** — complete the authorization code theft chain
-4. **WordPress plugin CVE testing** — check detected plugin versions on metro-markets.de for known vulnerabilities
+| Field | Value |
+|-------|-------|
+| **Severity** | Medium |
+| **CVSS 3.1** | 5.3 (AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N) |
+| **Asset** | app-seller-inventory.prod.de.metro-marketplace.cloud |
+| **Category** | CWE-942: Overly Permissive Cross-domain Whitelist / CWE-209: Error Message Information Leak |
+
+### Description
+
+A production internal microservice (`app-seller-inventory.prod.de.metro-marketplace.cloud`) for the Metro Marketplace seller inventory system is directly accessible from the internet without any network-level access restriction. The service has:
+
+1. **Wildcard CORS** (`Access-Control-Allow-Origin: *`) on all responses, with full method access (GET, POST, PUT, PATCH, DELETE, OPTIONS)
+2. **X-Impersonation-Session-Id header accepted** — the CORS `Access-Control-Allow-Headers` explicitly permits `X-Impersonation-Session-Id`, indicating session impersonation functionality
+3. **Valid product API endpoint** — `/api/v1/products` returns 401 "Token validation failed" (confirms real business logic endpoint)
+4. **Verbose error messages** — 404 responses reveal full internal routing URLs in error detail
+5. **Kubernetes infrastructure headers** — `x-ingress-controller: v2`, `x-ingress-request-id`, `x-ingress-request-start` reveal orchestration details
+6. **Multi-country timing exposure** — `timing-allow-origin` header lists 12 marketplace domains across 6 countries (DE, ES, IT, PT, NL, FR) in both production and pre-production
+
+Additionally, the Seller Office SPA (`www.metro-selleroffice.com`) exposes the production CDN hostname (`mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud`) and hardcoded SurveyMonkey API collector ID (`431080688`) in its 8MB JavaScript bundle.
+
+### Evidence
+
+**Wildcard CORS on production microservice:**
+```
+GET / HTTP/2
+Host: app-seller-inventory.prod.de.metro-marketplace.cloud
+
+HTTP/2 404
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: X-Impersonation-Session-Id,X-Active-Context,DNT,User-Agent,
+  X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,authorization,tid,
+  x-prerender,X-Correlation-Id,x-cms-location,X-Proxy-Service,X-Proxy-Location,
+  X-Country-Code,Country-Code,Accept-Language,Content-Language,X-ID-MM,X-ID-GA,
+  X-ID-OM,X-ID-CO,X-SOURCE,x-client-id,X-Analytics-User-Id,X-Session-Id
+timing-allow-origin: https://marketplace-pp.metro.de,https://marketplace-pp.makro.es,
+  https://marketplace-pp.metro.it,https://marketplace-pp.makro.pt,
+  https://marketplace-pp.makro.nl,https://marketplace-pp.metro.fr,
+  https://www.metro.de,https://www.makro.es,https://www.metro.it,
+  https://www.makro.pt,https://www.makro.nl,https://www.metro.fr
+x-ingress-controller: v2
+```
+
+**Valid product endpoint with auth check:**
+```
+GET /api/v1/products HTTP/2
+Host: app-seller-inventory.prod.de.metro-marketplace.cloud
+
+HTTP/2 401
+{"type":"authorization","title":"Authorization error","status":401,"detail":"Token validation failed"}
+```
+
+**Verbose error message revealing internal URL:**
+```
+GET /api/v1/config HTTP/2
+Host: app-seller-inventory.prod.de.metro-marketplace.cloud
+
+HTTP/2 404
+{"type":"about:blank","title":"Not found","status":404,
+ "detail":"No route found for \"GET https://app-seller-inventory.prod.de.metro-marketplace.cloud/api/v1/config\"",
+ "instance":null}
+```
+
+**Seller Office CDN hostname exposure in JavaScript:**
+```javascript
+window.cdn = "https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud";
+```
+
+### Impact
+
+- **Attack surface expansion**: Direct internet access to production internal microservices bypasses any API gateway security controls (rate limiting, WAF, authentication enforcement)
+- **Cross-origin data theft risk**: Wildcard CORS combined with the `X-Impersonation-Session-Id` header means any website could make cross-origin requests to this API; if a valid token is obtained, responses would be readable cross-origin
+- **Infrastructure mapping**: Verbose error messages, Kubernetes headers, and timing origins map the internal microservice architecture across 6 countries and both production/pre-production environments
+- **Internal hostname disclosure**: The CDN hostname pattern (`mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud`) reveals the internal naming convention for metro-marketplace.cloud services
+
+### Recommendation
+
+1. Restrict the microservice to internal/VPC access only — production microservices should not be directly internet-accessible
+2. Replace wildcard CORS with explicit origin allowlisting matching only the marketplace domains
+3. Remove `X-Impersonation-Session-Id` from CORS allowed headers on internet-facing services
+4. Suppress internal URLs and routing details from error messages
+5. Remove Kubernetes infrastructure headers from external responses
+6. Limit the `timing-allow-origin` header to only production domains
+
+---
+
+## Finding 38: IDAM Pre-Production OAuth Platform Exposed with Deprecated Grant Types and Load Balancer Cookie Leakage
+
+| Field | Value |
+|-------|-------|
+| **Severity** | Medium |
+| **CVSS 3.1** | 5.3 (AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N) |
+| **Asset** | idam-pp.metro.it, idam-pp.metrosystems.net |
+| **Category** | CWE-16: Configuration / CWE-200: Information Exposure |
+
+### Description
+
+The Metro AG IDAM (Identity and Access Management) pre-production instance at `idam-pp.metro.it` is fully accessible from the internet and exposes the same OAuth 2.0/OIDC misconfigurations documented in Finding 24 for the production platform:
+
+1. **Implicit flow enabled** — `response_types_supported` includes `token` and `id_token token` (RFC 9700 violation)
+2. **Password grant enabled** — `grant_types_supported` includes `password` (RFC 9700 violation)
+3. **Plain PKCE accepted** — `code_challenge_methods_supported` includes `plain` alongside `S256`
+4. **Token endpoint reachable** — Unlike production (blocked by Akamai WAF), the pre-prod token endpoint at `/authorize/api/oauth2/access_token` responds with proper OAuth error codes (400/401), confirming it processes requests
+5. **F5 BIG-IP load balancer cookies** — Both pre-prod and production IDAM expose F5 BIG-IP persistence cookies revealing backend pool names (`idam-pp.metrosystems.net-be-gcw1`, `idam-akamai-80`)
+
+The pre-production IDAM is referenced in the production CSP of `my-pp.metro.it` (`frame-src https://idam-pp.metro.it`) and uses client ID `AXCSS` with `realm_id=SSO_CUST_IT` for the Italian customer self-service portal.
+
+### Evidence
+
+**OpenID Configuration (pre-prod Italy):**
+```
+GET /.well-known/openid-configuration HTTP/2
+Host: idam-pp.metro.it
+
+{
+  "issuer": "https://idam-pp.metro.it",
+  "token_endpoint": "https://idam-pp.metro.it/authorize/api/oauth2/access_token",
+  "response_types_supported": ["code", "token", "id_token", "id_token token"],
+  "grant_types_supported": ["refresh_token", "client_credentials", "implicit",
+                            "authorization_code", "password"],
+  "code_challenge_methods_supported": ["plain", "S256"]
+}
+```
+
+**Token endpoint reachable (unlike production):**
+```
+POST /authorize/api/oauth2/access_token HTTP/2
+Host: idam-pp.metro.it
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=password&username=test&password=test&client_id=AXCSS&scope=openid
+
+HTTP/2 400
+{"error":"invalid_grant","error_description":"..."}
+```
+
+**F5 BIG-IP cookie leaking pool name:**
+```
+Set-Cookie: BIGipServeridam-pp.metrosystems.net-be-gcw1=!PKg93XWN7qTOhXz...;
+  path=/; Httponly; Secure
+
+Production equivalent:
+Set-Cookie: BIGipServeridam-akamai-80=!uERPyY9k/fCtTX+...;
+  path=/; Httponly; Secure
+```
+
+**OAuth state JWT structure (HS256, 24h expiry):**
+```json
+{
+  "rnd": "27118620-bcad-11f1-832f-e3af2af7c527",
+  "redirectUrl": "/personal/profile",
+  "iat": 1790758729,
+  "exp": 1790845129
+}
+```
+
+### Impact
+
+- **Pre-production as staging for production attacks**: The pre-prod token endpoint is fully functional (not WAF-blocked like production), allowing attackers to develop and test OAuth attack chains before targeting production
+- **Password grant attacks**: With a valid client ID (`AXCSS`), attackers can attempt password spraying directly against the token endpoint without user interaction
+- **Infrastructure exposure**: F5 BIG-IP pool names reveal backend architecture — `idam-pp.metrosystems.net-be-gcw1` indicates GCP-hosted backend, `idam-akamai-80` reveals the production Akamai integration topology
+- **Client ID harvesting**: The OAuth flow reveals client IDs, realm IDs, and redirect URIs for the customer portal system
+
+### Recommendation
+
+1. Restrict pre-production IDAM to VPN/internal access only
+2. Disable implicit flow and password grant on all IDAM instances (per RFC 9700)
+3. Remove `plain` from supported PKCE methods — enforce S256 only
+4. Configure F5 BIG-IP to use encrypted cookie names that do not reveal pool names
+5. Implement rate limiting on the pre-prod token endpoint
+
+---
+
+## Next Steps (Phase 15)
+
+1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform and seller inventory API
+2. **DOM-based XSS** — Module Federation `Function()` calls combined with `unsafe-eval` CSP; analyze SPA source maps for injection points
+3. **WordPress plugin CVE testing** — check detected plugin versions on metro-markets.de for known vulnerabilities (wp-media-folder 6.2.8, PersonioWP 1.0.0)
+4. **Open redirect chaining with Finding 15** — complete the authorization code theft chain
 5. **Subdomain enumeration** on 10 in-scope wildcard domains
-6. **service-aftersales-v2 deeper testing** — Laravel app with wildcard CORS and session cookies
-7. **m3t.ro URL shortener** — wildcard CORS with X-Impersonation-Session-Id
+6. **ConfigCat feature flag extraction** — the SDK key is server-injected; intercept via browser to extract feature flags potentially exposing hidden functionality
+7. **Seller inventory API route discovery** — `/api/v1/products` confirmed as valid endpoint; enumerate additional product/order/offer routes
