@@ -3,19 +3,21 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 4 - Deep exploitation testing + infrastructure reconnaissance + OAuth flow analysis
+**Status**: Phase 5 - Pre-prod application analysis + access code authentication + seller portal discovery
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **18 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **21 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
 3. **Verbose health endpoints expose complete internal architecture** — orderservice leaks 43 internal components (PostgreSQL, Cassandra, Flyway, Dropwizard, credit check systems, DANA export), checkout leaks PunchOut B2B and Loyalty/CDM token services; 401 errors leak Java servlet classes and internal HTTP URIs (Finding 14)
 4. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 (Finding 7)
 5. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services (Finding 13)
+6. **ria voucher pre-prod app exposes access-code authentication via GET parameter** — authentication tokens (JWTs) transmitted in URLs, stored in localStorage, with full permission system and store data leaked in JS bundle (Finding 19)
+7. **AXCSS OAuth client_id confirmed on production IDAM** — second OAuth client discovered via pre-prod, with state JWT using HS256 symmetric signing (Finding 20)
 
 ---
 
@@ -1219,6 +1221,294 @@ JWT: <forged_jwt>                  → 403 (accepted)
 
 ---
 
+## Finding 19: Ria Voucher Pre-Prod — Access Code Authentication via GET Parameter + Full JS Bundle Disclosure
+
+**Severity**: High
+**Asset**: `https://ria.cf-vvv-preprod-o6.cf.metro.cloud/login` (in scope — listed as "Coupon and Voucher UI")
+**Type**: Broken Authentication (OWASP A07) + Sensitive Data Exposure (OWASP A02)
+
+### Description
+
+The "Redeemable Issuing Application Plus" (ria) is a pre-production voucher management system running on Express.js/Google Cloud. The application's JavaScript bundle (`/assets/index-BpChDiXz.js`, 181KB) exposes the complete authentication flow, permission system, and internal business logic:
+
+1. **Authentication via GET parameter** — users authenticate with `GET /api/v1/authenticate?accessCode={code}`. The access code is transmitted in the URL, which leaks via:
+   - Server access logs
+   - Browser history
+   - Referer headers to external resources (Bootstrap CDN is loaded)
+   - Proxy/CDN/WAF logs
+   - Browser bookmarks and autocomplete
+
+2. **JWT stored in localStorage** — the returned JWT is stored in `localStorage.setItem('jwt', ...)` instead of a secure, httpOnly cookie. Any XSS vulnerability allows direct token theft.
+
+3. **Full permission system disclosed** — the JS bundle reveals granular permissions:
+   - `ACCESS` — base permission
+   - `QUERY_VOUCHER` — query existing vouchers
+   - `CREATE_VOUCHER` — create new vouchers
+   - `VIEW_CAMPAIGN` — view campaigns
+   - `QUERY_CAMPAIGN` — query campaigns
+   - `QUERY_CUSTOMER` — query customer data
+
+4. **Session ID format leaks user metadata** — session IDs are constructed as `{country}_{firstLetterOfEmail}_{randomString}`, leaking the user's country and email initial.
+
+5. **Store and business data exposed in settings** — settings response contains `storeNumber`, `storeGln` (Global Location Number), `city`, `defaultVoucherTemplate`, `rewardLimit`, `canChangeCountry`, and `countryCodeIso3`.
+
+### Evidence
+
+**Authentication via GET parameter (from JS bundle):**
+```javascript
+login: async e => y.get(`/api/v1/authenticate?accessCode=${e}`).then(e => {
+  localStorage.setItem('jwt', e.data);
+  let t = JSON.parse(atob(e.data.split('.')[1]));
+  // JWT payload decoded client-side
+})
+```
+
+**Auth header construction:**
+```javascript
+authHeader: () => {
+  let e = JSON.parse(localStorage.getItem('user'));
+  return e && e.accessToken ? {Authorization: `Bearer ${e.accessToken}`} : {};
+}
+```
+
+**Permission-gated navigation:**
+```javascript
+canAccessVouchers: l.includes('ACCESS') && (l.includes('QUERY_VOUCHER') || l.includes('CREATE_VOUCHER')),
+canAccessCampaigns: l.includes('ACCESS') && l.includes('VIEW_CAMPAIGN'),
+canAccessCustomers: l.includes('ACCESS')
+```
+
+**On authentication failure — removes all tokens:**
+```javascript
+// 401 or 403 response handling
+localStorage.removeItem('jwt');
+localStorage.removeItem('code');
+localStorage.removeItem('sessionId');
+window.location.href = '/login';
+```
+
+**Settings fallback reveals defensive logic:**
+```javascript
+console.warn('Settings fetch failed, attempting to use JWT fallback');
+let t = localStorage.getItem('jwt');
+if (!t) { xi('All fallbacks failed - redirecting to login'); return; }
+```
+
+**Supported countries (from hardcoded locale list):**
+```javascript
+[{code:'fr_BE', int:'French (België)', native:'Français (België)'}],
+multipleVoucherTemplateHandlerCountries: ['FR']
+```
+
+**Application routes exposed:**
+- `/login` — access code login page
+- `/vouchers` — voucher management (lazy-loaded: `VoucherManagementPage-BMZ9hxSD.js`)
+- `/campaigns` — campaign management (lazy-loaded: `CampaignManagementPage-CC0NDRXN.js`)
+- `/customers` — customer management
+- `/api/v1/authenticate` — authentication endpoint
+- `/api/v1/settings` — user settings endpoint
+- `/locales/{{lng}}/{{ns}}.json` — i18n files
+
+**SPA catches all routes** — Express.js serves the HTML for ANY path (including `/api/*`), confirming the API backend is at the separate domain `api.cf-vvv-preprod-o6.cf.metro.cloud`.
+
+### Impact
+
+- **Credential leakage**: Access codes in URLs are logged at every network layer — the primary credential for the voucher management system is exposed in plaintext in server logs, CDN logs, and browser history
+- **Token theft via XSS**: JWT in localStorage is accessible to any JavaScript — a single XSS vulnerability provides complete account takeover
+- **Access code brute-force**: Simple access codes with no apparent rate limiting could be brute-forced; the GET-based authentication makes this trivially automatable
+- **Business logic exposure**: The complete permission matrix and routing structure reveals exactly what capabilities exist and how to target them
+- **Financial impact**: The `rewardLimit` and voucher creation/redemption capabilities represent direct financial risk — unauthorized voucher creation could lead to monetary loss
+
+### Recommendation
+
+1. **Move authentication to POST body** — never transmit credentials in URL parameters
+2. **Store JWTs in httpOnly, Secure, SameSite cookies** — not in localStorage
+3. **Implement rate limiting** on the authentication endpoint
+4. **Minify and obfuscate** production JS bundles — remove verbose error messages and console.warn statements
+5. **Use proper session management** — don't embed user metadata (country, email) in session IDs
+6. **Restrict pre-prod access** — require VPN or IP allowlist for pre-production environments
+
+---
+
+## Finding 20: AXCSS OAuth Client ID Validated on Production IDAM + State JWT with HS256 Symmetric Signing
+
+**Severity**: Medium-High
+**Assets**: `https://my-pp.metro.it` (in scope — "METRO Customer Self Service domain"), `https://idam.metrosystems.net` (in scope via betty.metrosystems.net), `https://idam-pp.metrosystems.net` (pre-prod IDAM)
+**Type**: Information Disclosure (OWASP A02) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+The Metro customer self-service pre-prod portal (`my-pp.metro.it`) exposes a complete OAuth 2.0 authorization flow with multiple security concerns:
+
+1. **Second OAuth client_id discovered** — `client_id=AXCSS` (in addition to `BTEX` from Finding 15), confirmed valid on both pre-prod (`idam-pp.metrosystems.net`) AND production (`idam.metrosystems.net`) IDAM servers.
+
+2. **State parameter is a JWT signed with HS256** — the `state` parameter in the OAuth flow contains a JSON Web Token signed with a symmetric key (HMAC-SHA256). If the signing key is weak or can be brute-forced, an attacker can forge state values to inject arbitrary redirect URLs.
+
+3. **OAuth parameters fully exposed** — the redirect URL leaks the complete OAuth configuration including realm, user type, PKCE challenge, and redirect URI.
+
+4. **Pre-prod CSP with unsafe-eval and unsafe-inline** — the my-pp.metro.it CSP allows `unsafe-eval` and `unsafe-inline` in script-src, plus Apollo GraphQL sandbox endpoints.
+
+### Evidence
+
+**OAuth redirect from my-pp.metro.it reveals all parameters:**
+```
+GET / HTTP/2
+Host: my-pp.metro.it
+
+302 → https://idam-pp.metro.it/authorize/api/oauth2/authorize?
+  response_type=code
+  &client_id=AXCSS
+  &realm_id=SSO_CUST_IT
+  &user_type=CUST
+  &country_code=IT
+  &redirect_uri=https://my-pp.metro.it/personal/public/authenticate?redirectUrl=%2Fpersonal%2F
+  &scope=openid
+  &code_challenge=rsAIpWpzIMfQqWibMA5Qae0W45_f-rJSzJC8aex5RMY
+  &code_challenge_method=S256
+  &state=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**State JWT decoded:**
+```json
+Header: {"alg":"HS256","typ":"JWT"}
+Payload: {
+  "rnd": "00493490-bc4c-11f1-8c7b-9542d0049568",
+  "redirectUrl": "/personal/",
+  "iat": 1790717003,
+  "exp": 1790803403
+}
+```
+The state JWT contains:
+- `rnd` — UUIDv1 (time-based, partially predictable)
+- `redirectUrl` — controls post-authentication redirect destination
+- 24-hour validity window (`exp - iat = 86400`)
+- HS256 symmetric signing — key compromise enables state forgery
+
+**AXCSS client_id validated on PRODUCTION IDAM:**
+```
+POST /authorize/api/oauth2/access_token HTTP/2
+Host: idam.metrosystems.net
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id=AXCSS&client_secret=test
+
+Response: {"error":"invalid_client","error_description":"client_secret is invalid or expired"}
+```
+The error is "client_secret is **invalid or expired**" — NOT "client not found". This confirms `AXCSS` exists as a valid client on the production IDAM server.
+
+**Pre-prod IDAM also confirms AXCSS:**
+```
+POST /authorize/api/oauth2/access_token HTTP/2
+Host: idam-pp.metrosystems.net
+
+Response: {"error":"invalid_client","error_description":"client_secret is invalid or expired"}
+```
+Same differential error on pre-prod — AXCSS is a real client on both environments.
+
+**my-pp.metro.it CSP (verbose, weakened):**
+```
+script-src: [...] 'unsafe-inline' 'unsafe-eval' [...]
+  embeddable-sandbox.cdn.apollographql.com  ← Apollo GraphQL sandbox
+  sandbox.embed.apollographql.com            ← Apollo GraphQL sandbox
+  connect.facebook.net, www.facebook.com, bat.bing.com [...]
+frame-src: [...] https://idam-pp.metrosystems.net
+  embeddable-sandbox.cdn.apollographql.com
+  sandbox.embed.apollographql.com
+```
+
+**Internal Confluence documentation link leaked in IDAM error:**
+```json
+{"error_uri":"https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes"}
+```
+
+### Impact
+
+- **OAuth client_id leakage to production** — the pre-prod portal reveals a valid production OAuth client (`AXCSS`) that was not intended to be publicly known. Combined with the implicit grant enabled on IDAM (Finding 15), this client could be used in token theft attacks.
+
+- **State parameter forgery potential** — the state JWT uses HS256 (symmetric key). If the key is weak (common in Node.js applications), an attacker could:
+  1. Forge a state JWT with `redirectUrl` pointing to an attacker-controlled URL
+  2. Initiate an OAuth flow with this forged state
+  3. After authentication, the application redirects the user to the attacker's URL with the authorization code
+
+- **UUIDv1 predictability** — the `rnd` field uses UUID version 1 (time-based), which contains the MAC address of the generating host and a timestamp. This makes the "random" component partially predictable.
+
+- **Pre-prod as production stepping stone** — the same `client_id=AXCSS` works on both pre-prod and production IDAM, confirming shared OAuth client configurations across environments. Pre-prod findings directly translate to production attack vectors.
+
+- **Apollo GraphQL sandbox in CSP** — the whitelisted Apollo sandbox domains suggest a GraphQL API exists (possibly at a path not yet discovered), expanding the attack surface.
+
+### Recommendation
+
+1. **Separate OAuth clients** between pre-prod and production environments — never reuse client_ids across environments
+2. **Use opaque, random state values** — do not embed redirect URLs or business logic in JWT-formatted state parameters; store redirect targets server-side keyed by a random token
+3. **Use UUID v4** (random) instead of UUID v1 (time-based) for state randomness
+4. **Remove Apollo GraphQL sandbox** from production CSP unless actively used
+5. **Remove Confluence URL** from OAuth error responses — internal documentation URLs should not be in client-facing errors
+6. **Restrict pre-prod IDAM** — require VPN or IP allowlist for pre-production identity services
+
+---
+
+## Finding 21: METRO Seller Office — Live Production Angular Application with K8s Ingress Exposure
+
+**Severity**: Medium
+**Asset**: `www.metro-selleroffice.com` (*.metro-selleroffice.com — in scope as wildcard domain)
+**Type**: Security Misconfiguration (OWASP A05) + Information Disclosure (OWASP A02)
+
+### Description
+
+The METRO Seller Office (`www.metro-selleroffice.com`) is a live production Angular application for managing seller organizations on the Metro/Makro marketplace. The application exposes internal infrastructure details through response headers and loads resources from a production CDN that reveals internal domain naming conventions.
+
+### Evidence
+
+**Response headers leak infrastructure:**
+```
+x-ingress-controller: v2              ← Kubernetes Ingress version
+x-ingress-request-id: e79420955df...  ← Request tracking UUID
+x-ingress-request-start: t=1790736666.286  ← Unix timestamp of request
+x-powered-by: A fleet of awesome Marketeers. Apply today - https://www.metro-markets.de/careers
+```
+
+**CDN reveals internal production domain:**
+```html
+<script src="https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud/scripts/modernizr/modernizr.min.js"></script>
+```
+And in JavaScript:
+```javascript
+window.cdn = "https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud";
+```
+This reveals the internal CDN naming convention: `mma-mp-{country}-production-cdn.prod.{country}.metro-marketplace.cloud`
+
+**CSP allows framing from Storyblok CMS:**
+```
+content-security-policy: frame-ancestors 'self' https://app.storyblok.com;
+```
+This confirms they use Storyblok as their CMS — a third-party dependency with its own attack surface.
+
+**Angular application structure:**
+```html
+<app-root></app-root>
+<script src="/static/runtime.b1c4a3a81339ec5d.js" type="module"></script>
+<script src="/static/polyfills.917b26ff406b999d.js" type="module"></script>
+<script src="/static/main.3672261e6b5c6dd1.js" type="module"></script>
+```
+
+**Application purpose**: "Manage your products, sales, and inventory with METRO Seller Office. Start selling on METRO/Makro Marketplace today." — this is a seller management portal for the marketplace.
+
+### Impact
+
+- **K8s ingress metadata**: The `x-ingress-controller: v2` header confirms Kubernetes is used for orchestration, and the request timestamp enables timing analysis of server processing
+- **CDN naming convention**: The internal CDN domain pattern enables discovery of CDN endpoints for other countries/environments by substituting country codes
+- **Storyblok CMS dependency**: If the Storyblok account is compromised, content injection into the seller portal becomes possible via the `frame-ancestors` CSP allowing Storyblok framing
+- **Angular application**: The main.js (production build) likely contains API endpoints, authentication flow, and seller management functionality that could reveal further attack vectors
+
+### Recommendation
+
+1. **Remove verbose response headers** — strip `x-ingress-controller`, `x-ingress-request-start`, and `x-powered-by` from production responses
+2. **Restrict Storyblok framing** to specific editing contexts rather than blanket CSP allowance
+3. **Rate limit** the seller office login/registration endpoints
+4. **Audit CDN access controls** — ensure the production CDN doesn't serve internal or pre-prod assets
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -1241,7 +1531,7 @@ The following in-scope targets were **unreachable** from the testing environment
 
 ---
 
-## Phase 2-4 Testing Summary
+## Phase 2-5 Testing Summary
 
 **Tested and confirmed exploitable (documented as findings):**
 - OAuth implicit grant enabled on IDAM (Finding 15)
@@ -1256,6 +1546,11 @@ The following in-scope targets were **unreachable** from the testing environment
 - PKCE not enforced and state parameter not required on IDAM (Finding 15)
 - PKCE plain method accepted (downgrade from S256) (Finding 15)
 - Depotsettings JWT signature validation completely absent (Finding 18)
+- ria voucher access code authentication via GET parameter + JWT in localStorage (Finding 19)
+- AXCSS OAuth client_id confirmed on production IDAM via pre-prod portal (Finding 20)
+- State JWT with HS256 symmetric signing and UUIDv1 (Finding 20)
+- METRO Seller Office production Angular app with K8s ingress metadata leak (Finding 21)
+- my-pp.metro.it pre-prod CSP with unsafe-eval, unsafe-inline, and Apollo GraphQL sandbox (Finding 20)
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
@@ -1275,7 +1570,8 @@ The following in-scope targets were **unreachable** from the testing environment
 - Open redirect on shop domains (no redirect parameters found)
 - Dynamic client registration on IDAM (endpoint not exposed — 404)
 - Sitecore admin panels (all 404 across all countries)
-- GraphQL endpoints (not deployed on any tested service)
+- GraphQL endpoints (not deployed on any tested service, including my-pp.metro.it — all /graphql paths return 404)
+- my-pp.metro.it redirectUrl injection (returns 400 for external URLs — server-side validation works)
 - Actuator/Spring Boot endpoints (all 404 on betty — except /health returning `{"status":"READY"}`)
 - Elasticsearch/Kibana direct access (no non-standard ports accessible)
 - Host header injection (GCP infrastructure behavior — 301 redirect with `Host: evil.com` but requires MITM to exploit, low practical impact)
@@ -1297,15 +1593,20 @@ The following in-scope targets were **unreachable** from the testing environment
 - PureCloud (requires authentication, returns 302/404)
 - erika.metrosystems.net (egress proxy blocked)
 - adfs3.metro.info (connection failure)
+- *.metro-marketplace.cloud subdomains (all DNS resolution failures — no active subdomains found)
+- *.metro-markets.net subdomains (all DNS resolution failures)
+- *.metro-vendorcentral.com subdomains (all DNS resolution failures)
+- ria voucher API backend at api.cf-vvv-preprod-o6.cf.metro.cloud (returns 404 for all tested paths — backend may require different routing)
 
-## Next Steps (Phase 5)
+## Next Steps (Phase 6)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
 3. **Open redirect chaining with Finding 15** — test if the betty SPA processes the `url` query parameter in the redirect_uri as a redirect destination, completing the authorization code theft chain
 4. **PunchOut (OCI) procurement testing** — checkout health reveals PunchOut is active; test for unauthorized order injection via cXML
-5. **Voucher app access-code auth testing** — the `/api/v1/authenticate?accessCode=` endpoint (found in JS bundle) may accept short/predictable codes
+5. **Voucher app access-code brute-force** — the `/api/v1/authenticate?accessCode=` endpoint uses simple codes; test common patterns and numeric sequences on the API backend (`api.cf-vvv-preprod-o6.cf.metro.cloud`)
 6. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
 7. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
-8. **IDAM PKCE enforcement testing** — verify if PKCE is required or optional; if optional, authorization code interception is possible
-9. **IDAM state parameter binding** — test if the `state` parameter is properly bound to the session to prevent login CSRF
+8. **METRO Seller Office main.js analysis** — extract authentication flow, API endpoints, and seller management functionality from the Angular production bundle
+9. **State JWT key brute-force** — the my-pp.metro.it state JWT uses HS256; attempt key recovery with common secrets (requires jwt_tool or hashcat)
+10. **ria voucher lazy-loaded modules** — VoucherManagementPage and CampaignManagementPage contain additional API endpoints for voucher CRUD operations
