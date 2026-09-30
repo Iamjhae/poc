@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 10 - ServiceNow instance information disclosure + admin portal exposure
+**Status**: Phase 11 - CSP weaknesses + pre-production self-service portal exposure
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **28 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **30 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -2923,7 +2923,189 @@ GTM tracking on a pre-production system sends analytics data about internal empl
 
 ---
 
-## Next Steps (Phase 10)
+## Finding 29: CSP Weaknesses Across Metro Shop Platform — WebSocket Wildcard and Unsafe-Eval
+
+**Severity**: Low
+**CVSS**: 3.7 (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `consegne.metro.it`, `horeca-dagitim.metro-tr.com`, `online.metro.rs`, `shop.metro.md`, `dostavka-pp.metro.ua`, and all shop domains (in scope)
+**Type**: Security Misconfiguration (OWASP A05)
+
+### Description
+
+The Content Security Policy (CSP) deployed across all Metro AG shop domains contains multiple weaknesses that collectively defeat CSP's purpose as a defense-in-depth measure against XSS. The same weaknesses are present on both production and pre-production shop domains across all tested countries.
+
+### Evidence
+
+#### 29a. Wildcard WebSocket in connect-src
+
+```
+Content-Security-Policy: ...connect-src 'self' https://*.metro.it ... wss://* ...
+```
+
+The `wss://*` directive allows WebSocket connections to **any** server. If an attacker achieves XSS, they can establish a persistent WebSocket to an attacker-controlled server to exfiltrate session tokens, customer data, and pricing information in real-time, bypassing CSP entirely.
+
+**Confirmed on all tested shop domains:**
+- consegne.metro.it (Italy production)
+- horeca-dagitim.metro-tr.com (Turkey production)
+- online.metro.rs (Serbia production)
+- shop.metro.md (Moldova production)
+- dostavka-pp.metro.ua (Ukraine pre-production)
+
+#### 29b. Unsafe-Eval in script-src
+
+```
+script-src 'self' ... 'nonce-HXPLPGsPE1c0fYPYHNtLeQ' 'unsafe-eval';
+```
+
+While CSP nonces are used (`nonce-*`), the `'unsafe-eval'` directive completely undermines their protection by allowing:
+- `eval()` execution of attacker-injected strings
+- `new Function()` constructor
+- `setTimeout/setInterval` with string arguments
+
+This means any injection point that can reach `eval()` bypasses the nonce requirement.
+
+#### 29c. Unrestricted Font Loading
+
+```
+font-src 'self' https://*;
+```
+
+The `font-src https://*` directive allows font loading from any HTTPS domain. While lower impact, combined with CSS injection this enables data exfiltration via font-based side-channel attacks (Unicode-range probing).
+
+### Impact
+
+- **CSP bypass**: The combination of `wss://*` and `unsafe-eval` means CSP provides no effective mitigation against XSS on the shop platform
+- **Real-time exfiltration**: WebSocket wildcard enables persistent bidirectional channels to attacker servers — not just one-shot data theft but ongoing session hijacking
+- **Scope**: Affects all 15+ country shop domains, both production and pre-production, impacting millions of Metro customers
+
+### Recommendation
+
+1. Replace `wss://*` with specific WebSocket endpoints: `wss://*.mypurecloud.de wss://*.euc1.pure.cloud` (only Genesys Cloud requires WebSocket)
+2. Remove `'unsafe-eval'` from script-src — migrate any code using `eval()` to CSP-compatible alternatives
+3. Replace `font-src https://*` with specific font origins: `fonts.gstatic.com cdn.metro-online.com cdn.metro-group.com`
+4. Enable CSP `report-uri` monitoring to track violations during migration
+
+---
+
+## Finding 30: Pre-Production Self-Service Portal Exposure — Second Azure AD Tenant with OIDC Implicit Flow
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `my-pp.metro.ua`, `dostavka-pp.metro.ua` (*.metro.ua — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Broken Authentication (OWASP A07)
+
+### Description
+
+Metro AG's Ukrainian pre-production self-service portal at `my-pp.metro.ua` is publicly accessible on the internet, exposing a signup flow that uses a **second Azure AD tenant** (distinct from the one used for ServiceNow in Finding 27) with the OIDC implicit flow (`response_type=id_token`). Additionally, the pre-production shop platform at `dostavka-pp.metro.ua` is fully accessible and leaks extensive pre-production configuration including IDAM URLs, pre-prod CDN, and internal domain mappings. The CSP includes a localhost reference (`pk.betty-test.localhost`) indicating development configurations deployed to production.
+
+### Evidence
+
+#### 30a. Pre-Production Signup with Azure AD Implicit Flow
+
+```
+GET /signup/credentials HTTP/2
+Host: my-pp.metro.ua
+
+302 Found
+Location: https://login.microsoftonline.com/64322308-09a9-47a3-8c1c-b82871d60568/oauth2/v2.0/authorize
+  ?client_id=c449e83c-0410-445e-9438-0829bb4f2520
+  &scope=openid profile email
+  &response_type=id_token          ← OIDC Implicit flow
+  &redirect_uri=https://my-pp.metro.ua/signup/callback
+  &response_mode=form_post
+  &nonce=SI0JGyM9O1cpJ74kEe0eWfYXptGZWZiTQtmqpmOc_Lc
+  &state=eyJyZXR1cm5UbyI6Ii9zaWdudXAvY3JlZGVudGlhbHMifQ
+```
+
+**Key exposure:**
+- Azure AD tenant ID: `64322308-09a9-47a3-8c1c-b82871d60568` (different from ServiceNow tenant `1c824dff-9735-475a-9bfa-a16070bc0fd6`)
+- Client ID: `c449e83c-0410-445e-9438-0829bb4f2520`
+- Uses `response_type=id_token` — implicit flow transmits identity tokens in URL fragments
+- State parameter is base64-encoded JSON: `{"returnTo":"/signup/credentials"}` — potential open redirect vector
+
+#### 30b. Localhost Reference in CSP frame-ancestors
+
+```
+Content-Security-Policy: ...frame-ancestors my-pp.metro.ua *.metro.ua *.mm.metro.ua
+  *.metrosystems.net *.metro-group.com app.optimizely.com
+  cdn-assets-prod.s3.amazonaws.com *.adobemc.com
+  experience.adobe.com metro.experiencecloud.adobe.com
+  metro.zakaz.md metro-online.pk
+  pk.betty-test.localhost          ← Development localhost!
+  app.eu.veertly.com;
+```
+
+The presence of `pk.betty-test.localhost` in a production CSP indicates that development configurations were not properly sanitized before deployment. This also reveals the `betty-test` internal platform name.
+
+#### 30c. Pre-Production Shop Fully Accessible with Internal Configuration
+
+```
+GET /ordercapture/uidispatcher/static/injector.js HTTP/2
+Host: dostavka-pp.metro.ua
+
+var idam_login_base_url="https://idam-pp.metrosystems.net";
+var ev_support_base_url="https://api-private.pp.evaluate.metro.cloud/evaluate.support/";
+var mac_cdn_base_url="https://cdn-pp.metro-group.com";
+var tag_prison_domain="pp.metrotags.net";
+var datadogEnvironment="prod";   ← Pre-prod tagged as "prod"!
+```
+
+Additional pre-production URLs exposed:
+```
+selfServiceUrl: "https://myaccount-pp.metro.ua"
+signupLink: "https://my-pp.metro.ua/signup/credentials"
+lostCredentialsUrl: "https://premium-pp.metro.ua/oo2/ua/mcc/ukr/onlineordering/"
+siteCoreUrl: "https://www-rev-sc.metro.ua/data/apps/metro"
+idam-config.url: "https://idam-pp.metro.ua"
+idam-config.realm: "SSO_CUST_UA"
+domainFlavors: {"shop-pp.metro.ua": "store", "dostavka-pp.metro.ua": "fsd"}
+```
+
+#### 30d. Pre-Production Store Configurations Leaked
+
+The pre-prod injector.js reveals country configurations not visible in production:
+```javascript
+var mario_countries="FR,DE,ES,PL,HU,KZ,NL,PT,RU,TR,UA,RO,MD,CH,BG,HR,RS,JP,IT,IN,AT,SK,CZ,PK,KZ";
+var enzo_countries="AT,BG,CZ,DE,ES,FR,HR,IT,JP,KZ,MD,NL,PK,PL,PT,RO,RS,RU,SK,TR,UA";
+var combi_order_countries="FR,DE,PT";
+```
+
+The pre-prod includes countries not in production `mario_countries` list (RU, CH, IN, AT, SK, CZ, PK) — revealing upcoming country rollouts.
+
+#### 30e. Web Components Endpoint with Session Cookie
+
+```
+GET /web-components/?lang=uk&components=sidebar-navigation HTTP/2
+Host: my-pp.metro.ua
+
+200 OK
+Access-Control-Allow-Credentials: true
+Set-Cookie: wcsSessionId=s%3Ar5Z6...; Path=/web-components; HttpOnly; Secure; SameSite=Lax
+X-RateLimit-Limit: 20
+X-RateLimit-Remaining: 19
+```
+
+The web-components endpoint issues session cookies and has rate limiting, confirming it is an active API service, not just static content.
+
+### Impact
+
+- **Azure AD tenant enumeration**: Second tenant (`64322308-*`) expands the attack surface for Azure AD-specific attacks (token forgery, tenant misconfiguration)
+- **Implicit flow weakness**: ID tokens transmitted in URL fragments are susceptible to interception via browser history and Referer leakage
+- **Pre-production testing ground**: Publicly accessible pre-prod environments allow attackers to test exploits without production monitoring
+- **Country rollout intelligence**: Pre-prod configurations reveal upcoming launches in Russia, Switzerland, India, Austria, Slovakia, Czech Republic, and Pakistan
+- **Development artifact in production**: `pk.betty-test.localhost` in CSP shows inadequate configuration review processes
+
+### Recommendation
+
+1. Restrict `my-pp.metro.ua` and `dostavka-pp.metro.ua` access via VPN or IP allowlisting
+2. Migrate from OIDC implicit flow (`response_type=id_token`) to authorization code flow with PKCE
+3. Remove `pk.betty-test.localhost` and other development references from production CSP
+4. Ensure pre-production Datadog environment is tagged as `pre-prod`, not `prod`
+5. Use separate Azure AD app registrations for pre-production with restricted permissions
+
+---
+
+## Next Steps (Phase 11)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
