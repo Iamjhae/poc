@@ -3,24 +3,24 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 8 - Seller office config endpoint + internal service exposure + aftersales Laravel debug mode + complete route map extraction
+**Status**: Phase 9 - IDAM OAuth platform-wide misconfigurations + shop platform configuration exposure
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **23 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **25 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
-1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
-2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
-3. **Verbose health endpoints expose complete internal architecture** — orderservice leaks 43 internal components (PostgreSQL, Cassandra, Flyway, Dropwizard, credit check systems, DANA export), checkout leaks PunchOut B2B and Loyalty/CDM token services; 401 errors leak Java servlet classes and internal HTTP URIs (Finding 14)
-4. **3v Coupon API leaks full RSA public key** (2048-bit) through verbose JWT error messages, returning 500 Internal Server Error instead of 401 (Finding 7)
-5. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services (Finding 13)
-6. **ria voucher pre-prod app exposes access-code authentication via GET parameter** — authentication tokens (JWTs) transmitted in URLs, stored in localStorage, with full permission system and store data leaked in JS bundle (Finding 19)
-7. **AXCSS OAuth client_id confirmed on production IDAM** — second OAuth client discovered via pre-prod, with state JWT using HS256 symmetric signing (Finding 20)
+1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
+2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
+3. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
+4. **Shop platform injector.js exposes internal architecture** — GCP project ID `cf-ordercaptu-oc-prod-17`, private API URLs, DAM upload portal, 100+ store configurations, A/B experiments, IDAM realm names, and complete store UUID mappings — all unauthenticated (Finding 25)
+5. **Verbose health endpoints expose complete internal architecture** — orderservice leaks 43 internal components (PostgreSQL, Cassandra, Flyway, Dropwizard, credit check systems, DANA export), checkout leaks PunchOut B2B and Loyalty/CDM token services; 401 errors leak Java servlet classes and internal HTTP URIs (Finding 14)
+6. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services (Finding 13)
+7. **ria voucher pre-prod app exposes access-code authentication via GET parameter** — authentication tokens (JWTs) transmitted in URLs, stored in localStorage, with full permission system and store data leaked in JS bundle (Finding 19)
 8. **METRO Seller Office 8MB JS bundle exposes complete microservice architecture** — 20+ backend service URLs, admin impersonation endpoint (`/admin/impersonation/exchange` with `_switch_user` tokens), public activation code endpoint, commission fee structures (7-15%), and 4.7MB of unauthenticated translation files (Finding 21)
 9. **METRO Vendor Office platform-wide security failures** — Symfony debug mode leaking 18KB stack traces, CORS subdomain wildcard with credentials on ALL 8+ services, no rate limiting on login, PHPSESSID missing Secure flag, GCS bucket with public documents, 20+ microservice architecture fully mapped, 50+ API endpoints disclosed (Finding 22)
-10. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
+10. **IDAM OAuth insecure flows enabled** — redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 
 ---
 
@@ -2370,7 +2370,250 @@ The following in-scope targets were **unreachable** from the testing environment
 - betty.metro.{bg,de,fr,hr,hu,it,pk,pt,ro,rs,ua} — all blocked by egress proxy (HTTP 000)
 - Vendor Office notification-hub.metro-vendoroffice.com (returns 401 — Mercure SSE hub, auth required)
 
-## Next Steps (Phase 8)
+## Finding 24: IDAM OAuth 2.0 Platform-Wide Security Misconfigurations
+
+**Severity**: High
+**CVSS**: 7.4 (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N)
+**Asset**: `idam.metrosystems.net`, `idam.metro.de`, `idam.metro.fr`, `idam.metro.it` (*.metrosystems.net, *.metro.de — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Identification and Authentication Failures (OWASP A07)
+
+### Description
+
+Metro AG's IDAM (Identity and Access Management) platform — the central authentication system serving ALL country-specific shop domains — has multiple OAuth 2.0/OpenID Connect security misconfigurations that violate RFC 9700 (OAuth 2.0 Security Best Current Practice) and OAuth 2.1 recommendations. These misconfigurations are **identical across all tested IDAM instances**, indicating a shared platform-wide configuration issue.
+
+### Evidence
+
+#### 24a. OpenID Discovery Reveals Deprecated Flows (All Instances)
+
+```
+GET /.well-known/openid-configuration HTTP/2
+Host: idam.metrosystems.net
+
+200 OK
+{
+  "issuer": "https://idam.metrosystems.net",
+  "response_types_supported": ["code", "token", "id_token", "id_token token"],
+  "grant_types_supported": ["refresh_token", "client_credentials", "implicit", "authorization_code", "password"],
+  "code_challenge_methods_supported": ["plain", "S256"],
+  "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"]
+}
+```
+
+**Identical configuration confirmed on:**
+| IDAM Instance | Implicit Flow | Password Grant | Plain PKCE |
+|---|---|---|---|
+| `idam.metrosystems.net` | Enabled | Enabled | Accepted |
+| `idam.metro.de` | Enabled | Enabled | Accepted |
+| `idam.metro.fr` | Enabled | Enabled | Accepted |
+| `idam.metro.it` | Enabled | Enabled | Accepted |
+
+#### 24b. Implicit Flow Enabled (RFC 9700 Violation)
+
+`response_types_supported` includes `token` and `id_token token` — the implicit grant. Per RFC 9700 Section 2.1.2: "The implicit grant MUST NOT be used." Tokens in URL fragments leak via:
+- Browser history
+- Referer headers to third-party resources
+- Server access logs
+- Browser extensions with history access
+
+#### 24c. Password Grant Enabled (RFC 9700 Violation)
+
+`grant_types_supported` includes `password` (Resource Owner Password Credentials). Per RFC 9700 Section 2.4: "The resource owner password credentials grant MUST NOT be used." This grant type:
+- Exposes user credentials directly to client applications
+- Bypasses MFA/2FA if configured at the authorization endpoint
+- Enables credential stuffing at the token endpoint
+
+Token endpoint accepts the grant type (returns `invalid_client` rather than `unsupported_grant_type`):
+```
+POST /authorize/api/oauth2/access_token HTTP/2
+Host: idam.metrosystems.net
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=password&username=test@test.com&password=test123&scope=openid
+
+400 Bad Request
+{"error":"invalid_client","error_description":"client_id or client_secret is invalid",
+ "error_uri":"https://confluence.metrosystems.net/display/IDAM/IDAM+APIs+Error+Codes"}
+```
+
+Note: Error response also **leaks internal Confluence documentation URL** (`confluence.metrosystems.net`).
+
+#### 24d. Plain PKCE Accepted (Defeats PKCE Purpose)
+
+`code_challenge_methods_supported: ["plain", "S256"]` — accepting `plain` alongside `S256` means an attacker who intercepts the `code_challenge` can replay it directly as the `code_verifier`, completely defeating PKCE's purpose of protecting against authorization code interception.
+
+#### 24e. SAML Signing Key Exposed in JWKS
+
+The JWKS endpoint includes 5 RSA signing keys, one explicitly labeled as the SAML signing keypair:
+```
+GET /.well-known/openid-configuration/jwks HTTP/2
+Host: idam.metrosystems.net
+
+{
+  "keys": [
+    {"kid": "4bfbd538-9343-4b58-a99a-dbfd29d45e97", "kty": "RSA", "alg": "RS256", ...},
+    {"kid": "K_bdcf9403-6b50-48c0-af26-8c2128e46321", "kty": "RSA", "alg": "RS256", ...},
+    {"kid": "K_aa55015a-206a-11ed-98d5-e2cc12b0dc50", "kty": "RSA", "alg": "RS256", ...},
+    {"kid": "K_e5352d31-c354-11e9-9c78-0a58ac14002e", "kty": "RSA", "alg": "RS256", ...},
+    {"kid": "saml-signing-keypair", "kty": "RSA", "alg": "RS256",
+     "n": "18_XBfiRqnIGFIJmsLmjCTwTrgAtZbnBDIQDQuUn0jOj_6QbVbu7N4_..."}
+  ]
+}
+```
+
+The `saml-signing-keypair` key ID leaks that SAML federation is in use and exposes the public component of the SAML signing key. Combined with knowledge of the SAML endpoints, this enables targeted attacks on SAML assertion validation.
+
+### Impact
+
+- **Token theft via implicit flow**: An attacker who controls a registered or misconfigured `redirect_uri` (see Finding 15) can steal access tokens via URL fragments
+- **Credential harvesting via password grant**: Malicious applications can capture raw user credentials, bypassing the authorization server's consent screen and any configured MFA
+- **Authorization code interception**: Plain PKCE acceptance negates the PKCE security control, leaving the authorization code flow vulnerable to interception (mobile/native apps)
+- **Cross-country impact**: Identical misconfiguration across all tested country instances means fixing one instance without the others leaves the platform vulnerable
+
+### Recommendation
+
+1. Disable implicit grant and remove `token` and `id_token token` from supported response types
+2. Disable password grant and remove `password` from supported grant types
+3. Remove `plain` from supported PKCE methods, enforce `S256` only
+4. Remove the `saml-signing-keypair` from the OAuth JWKS endpoint (SAML keys should have their own metadata endpoint)
+5. Remove internal Confluence URL from error responses
+6. Apply these changes uniformly across all IDAM instances
+
+---
+
+## Finding 25: Shop Platform Injector.js Exposes Internal Architecture and GCP Infrastructure
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `lieferservice.metro.de`, `shop.metro.ro`, and all shop domains (*.metro.de, *.metro.ro — in scope)
+**Type**: Information Disclosure (OWASP A01) + Security Misconfiguration (OWASP A05)
+
+### Description
+
+Metro AG's e-commerce shop platform serves an unauthenticated `injector.js` configuration file to all visitors that exposes internal infrastructure details, GCP project identifiers, internal API URLs, A/B experiment configurations, complete store operational data, and Digital Asset Management upload portal URLs. This data is loaded without authentication on every page load across all country-specific shop domains.
+
+### Evidence
+
+#### 25a. GCP Project ID Leaked
+
+```
+GET /ordercapture/uidispatcher/static/injector.js HTTP/2
+Host: lieferservice.metro.de
+
+var gcpProjectId="cf-ordercaptu-oc-prod-17";
+var datadogEnvironment="prod";
+var datadogRumSampleRate="4";
+var datadogRumPremiumSampleRate="100";
+var datadogSessionReplayEnabled="true";
+```
+
+This is the **third distinct GCP project name** discovered (alongside `metro-markets-prod` and `metro-markets-staging` from Finding 23). The `cf-ordercaptu-oc-prod-17` project is specifically for the order capture system.
+
+#### 25b. Internal API URLs Exposed
+
+```javascript
+var idam_login_base_url="https://idam.metrosystems.net";
+var ev_support_base_url="https://api-private.prod.evaluate.metro.cloud/evaluate.support/";
+```
+
+The `api-private.prod.evaluate.metro.cloud` URL is explicitly labeled as a private API, yet its hostname is publicly disclosed.
+
+#### 25c. DAM Upload Portal URLs Exposed
+
+```javascript
+var creatives_upload_link="https://upload-dam.mac.metro-group.com/upload/select?clusterName=Banner";
+var storelist_upload_link="https://upload-dam.mac.metro-group.com/upload/select?clusterName=Category&categoryImageType=Storelist";
+```
+
+The Digital Asset Management upload portal is accessible from the internet at `upload-dam.mac.metro-group.com` — returns a full "MAC Upload Assistant" Angular application with IIS/10.0 backend.
+
+#### 25d. Complete Store Configuration (100+ Stores)
+
+The `storeactivation` variable contains operational data for **every German Metro store** (~100+ stores):
+```javascript
+storeactivation = {
+  "00603": {
+    "country": "DE",
+    "customerlogin": "ACTIVE",
+    "cutofftime": "11",
+    "cutofftimeholiday": "11",
+    "listimport": "ACTIVE",
+    "onlinevisibility": "ACTIVE",
+    "storeid": "00603",
+    "submitbackend": "CUSTOMER_ORDER"
+  },
+  "00605": {
+    "country": "DE",
+    "customerlogin": "DISABLED",
+    "submitbackend": "BETTY"
+  },
+  // ... 100+ more stores
+}
+```
+
+This reveals which stores use the BETTY backend vs CUSTOMER_ORDER, which stores have online ordering disabled, and detailed cutoff time configurations.
+
+#### 25e. A/B Experiment Feature Flags
+
+Complete experiment configurations including active/inactive states and traffic allocation ratios:
+```javascript
+var abExperiments = {
+  "ENABLE_SIDE_CADDY": {"active": true, "ratioAB": 0.0},
+  "SD_SHOW_ARTICLLESEARCH_CSAT": {"active": true, "ratioAB": 90.0},
+  // ...
+};
+var abExperimentsFeatureToggles = {
+  "METRO_X": {"group": "B"},
+  "CIA_NEW_CUSTOMER_PORTAL": {"group": "B"},
+  // 27+ feature flags
+};
+```
+
+#### 25f. IDAM Realm and Metro Markets API Configuration
+
+```javascript
+var optionalCountryConfig = {
+  "idam-config": {"url": "https://idam.metro.de", "realm": "SSO_CUST_DE"},
+  "metroMarketsApiUrl": "https://app-search-2.prod.de.metro-marketplace.cloud/api/v3/search/",
+  "metroMarketsBaseUrl": "https://www.metro.de/marktplatz/product/",
+  // ...
+};
+```
+
+Reveals IDAM realm names (`SSO_CUST_DE`, `SSO_CUST_RO` per country), internal marketplace search API endpoint, and self-service registration URLs.
+
+#### 25g. CIA Store ID Mapping (Complete UUID Database)
+
+The `/cia/content/sitecore/storeIdMappingWithOnlineVisibility/DE/de-DE` endpoint returns complete UUID-to-store mappings:
+```javascript
+window.exploreStoreIdMapping = {
+  "00618": "4d737651-64bc-44e2-a200-d86719236772",
+  "00403": "5252528c-6906-4350-a0d1-2b7e3d6ad246",
+  // ... 100+ UUID mappings
+};
+```
+
+These UUIDs could enable IDOR attacks against store-specific APIs.
+
+### Impact
+
+- **GCP project enumeration**: Attackers can map Metro AG's cloud infrastructure across at least 3 GCP projects
+- **Internal API discovery**: Private API endpoints like `api-private.prod.evaluate.metro.cloud` become targets for further probing
+- **Upload portal targeting**: The DAM upload portal running on IIS/10.0 represents an additional attack surface
+- **Business intelligence**: Detailed store operations data (active vs disabled stores, backend types, cutoff schedules) provides competitive intelligence
+- **Authentication targeting**: IDAM realm names and configurations enable more targeted OAuth attacks
+
+### Recommendation
+
+1. Move GCP project ID and Datadog configuration to server-side only
+2. Remove internal API URLs (`api-private.*`) from client-side JavaScript
+3. Remove DAM upload portal URLs from public JavaScript
+4. Restrict store operational data to authenticated sessions only
+5. Move A/B experiment configurations to a server-side evaluation endpoint
+6. Ensure the DAM upload portal (`upload-dam.mac.metro-group.com`) requires authentication
+
+---
+
+## Next Steps (Phase 9)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
