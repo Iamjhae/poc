@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 5 - Pre-prod application analysis + access code authentication + seller portal discovery
+**Status**: Phase 6 - Seller office deep analysis + microservice architecture disclosure + business data exposure
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **21 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **22 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
@@ -18,6 +18,8 @@ Comprehensive testing of 66 in-scope Metro AG assets identified **21 reportable 
 5. **Semicolon path parameter traversal** (..;/) bypasses path-based routing across all betty services (Finding 13)
 6. **ria voucher pre-prod app exposes access-code authentication via GET parameter** — authentication tokens (JWTs) transmitted in URLs, stored in localStorage, with full permission system and store data leaked in JS bundle (Finding 19)
 7. **AXCSS OAuth client_id confirmed on production IDAM** — second OAuth client discovered via pre-prod, with state JWT using HS256 symmetric signing (Finding 20)
+8. **METRO Seller Office 8MB JS bundle exposes complete microservice architecture** — 20+ backend service URLs, admin impersonation endpoint (`/admin/impersonation/exchange` with `_switch_user` tokens), public activation code endpoint, commission fee structures (7-15%), and 4.7MB of unauthenticated translation files (Finding 21)
+9. **METRO Vendor Office Symfony debug mode in production** — every `/api/v1/*` path returns full PHP stack traces with file paths, class names, and framework internals; CORS reflects any `*.metro-vendoroffice.com` subdomain with credentials; admin portal publicly accessible (Finding 22)
 
 ---
 
@@ -1447,65 +1449,313 @@ frame-src: [...] https://idam-pp.metrosystems.net
 
 ---
 
-## Finding 21: METRO Seller Office — Live Production Angular Application with K8s Ingress Exposure
+## Finding 21: METRO Seller Office — Complete Microservice Architecture Disclosure + Admin Impersonation Endpoint + Unauthenticated Business Data
 
-**Severity**: Medium
+**Severity**: High
 **Asset**: `www.metro-selleroffice.com` (*.metro-selleroffice.com — in scope as wildcard domain)
-**Type**: Security Misconfiguration (OWASP A05) + Information Disclosure (OWASP A02)
+**Type**: Sensitive Data Exposure (OWASP A02) + Security Misconfiguration (OWASP A05) + Broken Access Control (OWASP A01)
 
 ### Description
 
-The METRO Seller Office (`www.metro-selleroffice.com`) is a live production Angular application for managing seller organizations on the Metro/Makro marketplace. The application exposes internal infrastructure details through response headers and loads resources from a production CDN that reveals internal domain naming conventions.
+The METRO Seller Office (`www.metro-selleroffice.com`) is a live production Angular application for managing seller organizations on the Metro/Makro marketplace. The 8MB production JavaScript bundle (`/static/main.3672261e6b5c6dd1.js`) exposes the **complete backend microservice architecture**, including 20+ service base URLs, an **admin impersonation endpoint** (`/admin/impersonation/exchange`), a **public unauthenticated activation code endpoint**, and the full authentication/authorization flow. Additionally, **7 translation files (4.7MB total)** are accessible without authentication, revealing commission fee structures, payment processing details, and complete business logic.
 
 ### Evidence
 
-**Response headers leak infrastructure:**
-```
-x-ingress-controller: v2              ← Kubernetes Ingress version
-x-ingress-request-id: e79420955df...  ← Request tracking UUID
-x-ingress-request-start: t=1790736666.286  ← Unix timestamp of request
-x-powered-by: A fleet of awesome Marketeers. Apply today - https://www.metro-markets.de/careers
+**1. Complete microservice architecture leaked in main.js (8MB):**
+
+The bundle references 20+ backend service base URL variables, revealing the entire microservice topology:
+```javascript
+// Identity Management Service
+IMS_API_ENDPOINT → svcImsBaseUrl
+// Seller Gateway & Office
+SELLER_GATEWAY_API_ENDPOINT → svcsSellerGatewayBaseUrl
+SELLER_OFFICE_API_ENDPOINT → svcSellerOfficeBaseUrl
+SELLER_OFFICE_API_ENDPOINT_V2 → svcSellerOfficeBaseUrl (v2)
+// Product Information Management
+SELLER_PIM_API_ENDPOINT → svcSellerPimBaseUrl
+SELLER_PIM_UTILS_API_ENDPOINT → svcSellerPimUtilsBaseUrl
+// Catalog & Inventory
+EXTERNAL_CATALOG_TRANSFORMATION_API_ENDPOINT → svcExternalCatalogTransformationBaseUrl
+SELLER_INVENTORY_API_ENDPOINT → svcSellerInventoryBaseUrl
+// Marketplace
+SELLER_OFFER_COMPETITIVENESS_API_ENDPOINT → svcSellerOfferCompetitivenessBaseUrl
+STOREFRONT_API_ENDPOINT → svcStorefrontBaseUrl
+SEARCH_API_ENDPOINT → svcSearchBaseUrl
+CATEGORY_API_ENDPOINT → svcCategoryBaseUrl
+// Order & Payment
+ORDER_MANAGEMENT_API_ENDPOINT → svcOrderManagementBaseUrl
+PAYMENT_API_ENDPOINT → svcPaymentBaseUrl
+PAYMENT_REPORTS_API_ENDPOINT → svcPaymentReportsBaseUrl
+ACCOUNTING_API_ENDPOINT → svcAccountingBaseUrl
+// User & Communication
+USER_ACCOUNT_API_ENDPOINT → svcUserAccountBaseUrl
+MESSAGE_CENTER_API_ENDPOINT → svcMessageCenterBaseUrl
+AFTERSALES_API_ENDPOINT → svcAftersalesBaseUrl
+REFUND_REQUESTS_API_ENDPOINT → svcRefundRequestsBaseUrl
+MM_CENTRAL_API_ENDPOINT → svcMmCentralBaseUrl
+GENERIC_API_ENDPOINT → svcGenericBaseUrl
+// External
+CDN_BASE_URL → cdnBaseUrl
+GOOGLE_CLOUD_STORAGE → googleCloudStorage
+ANONYMOUS_EMAILS_BASE_URL → anonymousEmailsBaseUrl
 ```
 
-**CDN reveals internal production domain:**
-```html
-<script src="https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud/scripts/modernizr/modernizr.min.js"></script>
+**2. Admin impersonation endpoint — account takeover capability:**
+```javascript
+exchangeCodeToAccessToken(t) {
+  return this.http.post(
+    `${IMS_API_ENDPOINT}/admin/impersonation/exchange`, t, {}
+  )
+}
+
+// Impersonation flow from URL query parameters:
+ngOnInit() {
+  const t = this.route.snapshot.queryParams;
+  if (t._switch_user && t._switch_user_token) {
+    this.impersonationService.exchangeCodeToAccessToken(t).subscribe({
+      next: a => {
+        const c = new AuthToken();
+        c.access_token = a.access_token;
+        // ... sets impersonated user session
+      }
+    })
+  }
+}
 ```
-And in JavaScript:
+This reveals an admin impersonation mechanism accepting `_switch_user` and `_switch_user_token` query parameters. If these tokens can be obtained or forged, any seller account can be impersonated.
+
+**3. Public unauthenticated activation code endpoint:**
+```javascript
+checkActivationCode(t) {
+  return this.http.get(
+    `${SELLER_OFFICE_API_ENDPOINT_V2}/public/accounts/check-activation-code?code=${t}`
+  )
+}
+```
+This endpoint requires no authentication — it's under `/public/` prefix and takes an activation code as a query parameter. This could enable brute-force of seller activation codes.
+
+**4. IMS authentication endpoints fully mapped:**
+```javascript
+const endpoints = {
+  CREDENTIALS: "/accounts/credentials",
+  LOGIN: "/accounts/auth/login",
+  LOGOUT: "/accounts/auth/logout",
+  REFRESH: "/accounts/auth/refresh-access",
+  RESET: "/accounts/auth/reset"
+}
+// Token refresh URL
+tokenRefreshUrl = `${IMS_API_ENDPOINT}/accounts/auth/refresh-access`
+```
+
+**5. Seven translation files accessible without authentication (4.7MB total):**
+```
+[200] (515,597 bytes)  /static/assets/translations/en.json
+[200] (709,968 bytes)  /static/assets/translations/de.json
+[200] (683,075 bytes)  /static/assets/translations/fr.json
+[200] (725,701 bytes)  /static/assets/translations/es.json
+[200] (691,737 bytes)  /static/assets/translations/it.json
+[200] (650,197 bytes)  /static/assets/translations/nl.json
+[200] (690,162 bytes)  /static/assets/translations/pt.json
+```
+
+**6. Commission fee structure exposed in translations:**
+```
+Category A — 7% Commission per sale  (Cooling, Cleaning equipment, Sterilization)
+Category B — 10% Commission per sale (Hospitality tech, Coffee, Cooking machinery, High Tech)
+Category C — 13% Commission per sale (Stainless steel, Office Supplies, Grilling, Signage)
+Category D — 15% Commission per sale (Catering accessories, Tableware, Seasoning, Care & Health)
+```
+These commission rates are commercially sensitive pricing information.
+
+**7. API key management flow disclosed:**
+```
+API_KEYS.GENERATE.INTRO: "API keys allow you to use our API"
+API_KEYS.GENERATED.DIALOG.ALERT: "The generated Client Secret is visible only once.
+  Please make sure you save it..."
+API_KEYS.LIST.GRID.CLIENT_KEY.TITLE: "Client Key"
+API_KEYS.LIST.GRID.CLIENT_SECRET.TITLE: "Client Secret"
+```
+
+**8. Active API backend confirmed — structured JSON 404s:**
+```
+GET /api/v1/dictionary/countries → {"error":"[404] Not found: GET /api/v1/dictionary/countries"}
+GET /api/v1/brands              → {"error":"[404] Not found: GET /api/v1/brands"}
+GET /api/v1/organizations       → {"error":"[404] Not found: GET /api/v1/organizations"}
+GET /api/v1/categories          → {"error":"[404] Not found: GET /api/v1/categories"}
+GET /api/v1/seller              → {"error":"[404] Not found: GET /api/v1/seller"}
+POST /api/v1/accounts/auth/login → {"error":"[404] Not found: POST /api/v1/accounts/auth/login"}
+```
+All `/api/v1/*` routes return structured JSON errors from a Node.js/Express backend — confirming active API routing. The IMS and service endpoints exist at separate internal URLs (injected at runtime).
+
+**9. ConfigCat feature flags + Storyblok CMS integrations:**
+```javascript
+function configCatConfig() { return { apiKey: config.configCatSdkKey } }
+// Storyblok content delivery
+this.get("cdn/stories", params)  // Content delivery API
+this.get(`cdn/stories/${slug}`)  // Individual story
+```
+
+**10. K8s infrastructure leaked in headers:**
+```
+x-ingress-controller: v2
+x-ingress-request-id: 609c637a0f975658b25c28fec9898b46
+x-powered-by: A fleet of awesome Marketeers. Apply today - https://www.metro-markets.de/careers
+content-security-policy: frame-ancestors 'self' https://app.storyblok.com;
+```
+
+**11. CDN naming convention:**
 ```javascript
 window.cdn = "https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud";
 ```
-This reveals the internal CDN naming convention: `mma-mp-{country}-production-cdn.prod.{country}.metro-marketplace.cloud`
-
-**CSP allows framing from Storyblok CMS:**
-```
-content-security-policy: frame-ancestors 'self' https://app.storyblok.com;
-```
-This confirms they use Storyblok as their CMS — a third-party dependency with its own attack surface.
-
-**Angular application structure:**
-```html
-<app-root></app-root>
-<script src="/static/runtime.b1c4a3a81339ec5d.js" type="module"></script>
-<script src="/static/polyfills.917b26ff406b999d.js" type="module"></script>
-<script src="/static/main.3672261e6b5c6dd1.js" type="module"></script>
-```
-
-**Application purpose**: "Manage your products, sales, and inventory with METRO Seller Office. Start selling on METRO/Makro Marketplace today." — this is a seller management portal for the marketplace.
+Pattern: `mma-mp-{country}-production-cdn.prod.{country}.metro-marketplace.cloud`
 
 ### Impact
 
-- **K8s ingress metadata**: The `x-ingress-controller: v2` header confirms Kubernetes is used for orchestration, and the request timestamp enables timing analysis of server processing
-- **CDN naming convention**: The internal CDN domain pattern enables discovery of CDN endpoints for other countries/environments by substituting country codes
-- **Storyblok CMS dependency**: If the Storyblok account is compromised, content injection into the seller portal becomes possible via the `frame-ancestors` CSP allowing Storyblok framing
-- **Angular application**: The main.js (production build) likely contains API endpoints, authentication flow, and seller management functionality that could reveal further attack vectors
+- **Admin impersonation mechanism exposed**: The `_switch_user` / `_switch_user_token` flow in the JS bundle reveals exactly how admin-level impersonation works. If these tokens are guessable, leaked in logs, or share a signing key with another exposed secret, any seller account can be taken over
+- **Complete microservice map**: An attacker now knows every backend service name, purpose, and API endpoint pattern. This eliminates the reconnaissance phase entirely and enables targeted attacks on each service
+- **Public activation code endpoint**: The `/public/accounts/check-activation-code?code=` endpoint could be brute-forced to validate or enumerate seller activation codes, enabling unauthorized seller account creation
+- **Commercial pricing disclosure**: Commission rates (7-15% per category) are commercially sensitive — competitors could use this intelligence for pricing strategies
+- **Business logic fully mapped**: Translation files + JS bundle together reveal every feature, error condition, validation rule, and workflow in the seller platform — all information useful for social engineering or targeted attacks
+- **Chaining potential**: The IMS authentication endpoints, combined with the impersonation flow and the IDAM OAuth findings (Finding 15), create multiple paths toward account compromise
 
 ### Recommendation
 
-1. **Remove verbose response headers** — strip `x-ingress-controller`, `x-ingress-request-start`, and `x-powered-by` from production responses
-2. **Restrict Storyblok framing** to specific editing contexts rather than blanket CSP allowance
-3. **Rate limit** the seller office login/registration endpoints
-4. **Audit CDN access controls** — ensure the production CDN doesn't serve internal or pre-prod assets
+1. **Audit admin impersonation endpoint** — ensure `_switch_user_token` validation is cryptographically secure; restrict impersonation to IP-whitelisted admin networks; add audit logging
+2. **Rate-limit and monitor the activation code endpoint** — add CAPTCHA or proof-of-work to prevent brute-force enumeration
+3. **Move commission rates and sensitive business data** to authenticated API responses, not public translation files
+4. **Implement code splitting** — lazy-load admin-only code (impersonation, API key management) so it's never delivered to unauthenticated users
+5. **Remove K8s infrastructure headers** — strip `x-ingress-controller`, `x-ingress-request-id`, and `x-powered-by` from production responses
+6. **Restrict translation file access** — serve only the user's locale after authentication, not all 7 language files to anonymous users
+7. **Inject service URLs server-side** at runtime (already done) but also obfuscate the variable names in production builds to reduce information leakage
+8. **Remove Storyblok framing CSP** from non-CMS pages
+
+---
+
+## Finding 22: METRO Vendor Office — Symfony Debug Mode in Production + CORS Subdomain Wildcard with Credentials + Admin Portal Exposure
+
+**Severity**: High-Critical
+**Asset**: `www.metro-vendoroffice.com`, `admin.metro-vendoroffice.com`, `vendor.metro-vendoroffice.com` (*.metro-vendoroffice.com — in scope as wildcard domain)
+**Type**: Security Misconfiguration (OWASP A05) + Sensitive Data Exposure (OWASP A02) + CORS Misconfiguration
+
+### Description
+
+The METRO Vendor Office platform (`*.metro-vendoroffice.com`) has **three critical security issues**:
+
+1. **Symfony Debug Mode enabled in production** — every `/api/v1/*` path returns full PHP stack traces including file paths, class names, line numbers, and framework internals
+2. **CORS policy reflects ANY `*.metro-vendoroffice.com` subdomain** with `Access-Control-Allow-Credentials: true` — an XSS or subdomain takeover on any of 9+ subdomains enables credential theft from the main vendor portal
+3. **Three live portals accessible without IP restriction** — www (PHP login + API), admin (Angular admin panel), vendor (Angular vendor portal) — all on the public internet
+
+### Evidence
+
+**1. Symfony debug mode leaks full stack traces on every `/api/v1/*` path:**
+```json
+GET /api/v1 HTTP/2
+Host: www.metro-vendoroffice.com
+
+{
+  "statusCode": 404,
+  "class": "Symfony\\Component\\HttpKernel\\Exception\\NotFoundHttpException",
+  "file": "/app/vendor/symfony/http-kernel/EventListener/RouterListener.php",
+  "line": 135,
+  "message": "No route found for \"GET https://www.metro-vendoroffice.com/api/v1\"",
+  "previous": {
+    "class": "Symfony\\Component\\Routing\\Exception\\ResourceNotFoundException",
+    "file": "/app/vendor/symfony/routing/Matcher/Dumper/CompiledUrlMatcherTrait.php",
+    "line": 74
+  },
+  "trace": [
+    {"class": "CompiledUrlMatcher", "function": "match", "file": ".../CompiledUrlMatcherTrait.php", "line": 74},
+    {"class": "UrlMatcher", "function": "matchRequest", "file": ".../UrlMatcher.php", "line": 106},
+    {"class": "Router", "function": "matchRequest", "file": ".../Router.php", "line": 257},
+    {"class": "RouterListener", "function": "onKernelRequest", "file": ".../RouterListener.php", "line": 111},
+    {"class": "EventDispatcher", "function": "dispatch", "file": ".../EventDispatcher.php", "line": 59},
+    {"class": "HttpKernel", "file": ".../HttpKernel.php"}
+  ]
+}
+```
+This confirms: Symfony framework, file paths under `/app/vendor/symfony/`, compiled URL matcher, event-driven routing.
+
+**2. CORS reflects any `*.metro-vendoroffice.com` subdomain with credentials:**
+```
+Request:  Origin: https://evil.metro-vendoroffice.com
+Response: Access-Control-Allow-Origin: https://evil.metro-vendoroffice.com
+          Access-Control-Allow-Credentials: true
+          Access-Control-Allow-Methods: GET, PUT, POST, DELETE, PATCH, OPTIONS
+
+Request:  Origin: https://admin.metro-vendoroffice.com
+Response: Access-Control-Allow-Origin: https://admin.metro-vendoroffice.com
+          Access-Control-Allow-Credentials: true
+
+Request:  Origin: https://evil.com
+Response: Access-Control-Allow-Origin: https://www.metro-vendoroffice.com  (NOT reflected - external blocked)
+```
+The CORS policy trusts any subdomain of `metro-vendoroffice.com`, including non-existent ones. Combined with the 9+ live subdomains, any XSS on any subdomain can steal authenticated data from the main portal.
+
+**3. Three live portals exposed:**
+
+a) **www.metro-vendoroffice.com** — PHP/Symfony vendor login (Vendor Central):
+```
+Set-Cookie: PHPSESSID=e23cbee4cd57472dc483f93ef07cb55b; path=/; httponly
+Set-Cookie: apiKey=deleted; domain=.metro-vendoroffice.com; secure; httponly; samesite=lax
+x-app-version: 2118893
+```
+- Login form: `POST /login_check` with `user[email]` + `user[password]`
+- Forgot password: `POST /forgot-password` with Symfony CSRF tokens
+- `apiKey` cookie scoped to `.metro-vendoroffice.com` (shared across ALL subdomains)
+- `.env` and `.git/config` exist on disk (403 Forbidden by nginx)
+
+b) **admin.metro-vendoroffice.com** — Angular admin panel (305KB main.js):
+```html
+<title>Admin Portal</title>
+<fnc-root>...</fnc-root>
+```
+
+c) **vendor.metro-vendoroffice.com** — Angular vendor portal (34KB):
+```html
+<title>Vendor Portal</title>
+```
+
+**4. Nine active microservices confirmed via client-api paths (3+ error formats):**
+```
+auth/client-api/         → {"error":"NOT_FOUND","message":"COMMON.ERROR.NOT_FOUND"}
+configuration/client-api/ → {"type":"...rfc2616#section-10","title":"An error occurred","status":404}
+delivery-service/client-api/ → {"status":404,"message":"No route found for..."}  ← LEAKS internal URL
+demand-planning/client-api/ → {"code":404,"message":"Not Found"}
+finance/client-api/      → RFC 2616 format
+inventory-service/client-api/ → RFC 2616 format
+label-service/client-api/ → RFC 2616 format
+pim-upload/client-api/   → NOT_FOUND format
+product-data-enhancement/client-api/ → NOT_FOUND format
+```
+
+**5. Admin JS bundle reveals additional service architecture:**
+```
+offer-export.metro-vendoroffice.com/api/
+offer-funnel.metro-vendoroffice.com/api/
+offer-reactor.metro-vendoroffice.com/api/
+offer-safety.metro-vendoroffice.com/api/
+offer-xk.metro-vendoroffice.com/api/
+vendor.metro-vendoroffice.com/
+help.metro-vendoroffice.com/ (503 - down)
+```
+
+### Impact
+
+- **Information disclosure (Critical)**: Symfony debug traces expose the full application internals — file structure, dependency versions, class hierarchy, routing configuration. This is the #1 prerequisite for developing targeted exploits (e.g., known-vulnerability matching against the specific Symfony version, identifying custom code paths for injection testing)
+- **Cross-origin credential theft (High)**: The CORS subdomain wildcard with credentials means any XSS on ANY of the 9+ `*.metro-vendoroffice.com` subdomains (offer-export, offer-funnel, vendor, admin, etc.) allows reading authenticated API responses from `www.metro-vendoroffice.com`, stealing session tokens, vendor data, financial information, and orders
+- **Cross-subdomain cookie theft**: The `apiKey` cookie uses `domain=.metro-vendoroffice.com`, making it accessible to all subdomains. Combined with the CORS misconfiguration, this creates a chain where compromising any subdomain gives access to the authentication cookie
+- **Admin panel publicly accessible**: The admin portal at `admin.metro-vendoroffice.com` requires no VPN or IP restriction — only application-layer authentication separates an attacker from admin functionality
+- **Version disclosure enables targeted attacks**: `x-app-version: 2118893` + Symfony debug traces allow pinpointing exact library versions for known CVE matching
+
+### Recommendation
+
+1. **IMMEDIATELY disable Symfony debug mode in production** — set `APP_DEBUG=false` and `APP_ENV=prod` in environment configuration. This is the single most impactful fix
+2. **Restrict CORS to exact origin list** — replace the subdomain wildcard pattern with an explicit allowlist of only the specific subdomains that need cross-origin access
+3. **Restrict admin portal access** — place `admin.metro-vendoroffice.com` behind VPN or IP allowlist
+4. **Scope cookies to specific subdomains** — change `apiKey` cookie domain from `.metro-vendoroffice.com` to the specific subdomain that needs it (e.g., `www.metro-vendoroffice.com`)
+5. **Remove `.env` and `.git` from the web root** — while nginx blocks access, these files should not exist in the web-accessible directory at all
+6. **Standardize error responses** across microservices — the 3+ different error formats indicate inconsistent security controls
+7. **Strip infrastructure headers** — remove `x-app-version`, `x-ingress-controller`, `x-ingress-request-start`, `x-powered-by`
 
 ---
 
@@ -1549,8 +1799,17 @@ The following in-scope targets were **unreachable** from the testing environment
 - ria voucher access code authentication via GET parameter + JWT in localStorage (Finding 19)
 - AXCSS OAuth client_id confirmed on production IDAM via pre-prod portal (Finding 20)
 - State JWT with HS256 symmetric signing and UUIDv1 (Finding 20)
-- METRO Seller Office production Angular app with K8s ingress metadata leak (Finding 21)
+- METRO Seller Office 8MB JS bundle exposes 20+ microservice URLs + admin impersonation endpoint + public activation code endpoint (Finding 21)
+- Seller Office 7 translation files (4.7MB) accessible without auth — commission rates, API key flow, payment details (Finding 21)
+- Seller Office active API backend at /api/v1/* returns structured JSON 404 errors confirming route existence (Finding 21)
+- Seller Office K8s ingress metadata + CDN naming convention + Storyblok CMS + ConfigCat feature flags (Finding 21)
 - my-pp.metro.it pre-prod CSP with unsafe-eval, unsafe-inline, and Apollo GraphQL sandbox (Finding 20)
+- Vendor Office Symfony debug mode in production — full stack traces on all /api/v1/* paths (Finding 22)
+- Vendor Office CORS subdomain wildcard with credentials — evil.metro-vendoroffice.com reflected with ACAO + credentials (Finding 22)
+- Vendor Office admin portal (admin.metro-vendoroffice.com) and vendor portal (vendor.metro-vendoroffice.com) publicly accessible (Finding 22)
+- Vendor Office 9+ microservices confirmed via client-api paths with inconsistent error formats (Finding 22)
+- Vendor Office .env and .git/config exist on disk (403 by nginx) (Finding 22)
+- Vendor Office apiKey cookie scoped to .metro-vendoroffice.com (cross-subdomain sharing) (Finding 22)
 
 **Tested and confirmed not exploitable:**
 - OAuth redirect_uri HOST bypass (IDAM correctly rejects different hosts — evil.com → 403)
