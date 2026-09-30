@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 13 - Order fulfillment backoffice exposure + continued deep probing
+**Status**: Phase 14 - Host header injection, WordPress exposure, continued deep probing
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **34 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **36 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3454,13 +3454,197 @@ POST /ordercapture/login/auth/singleSignOn
 
 ---
 
-## Next Steps (Phase 13)
+## Finding 35: Host Header Injection on Betty Shop Platform — Platform-Wide 301 Redirect to Attacker Domain
 
-1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
-2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
-3. **Open redirect chaining with Finding 15** — test if the betty SPA processes the `url` query parameter in the redirect_uri as a redirect destination, completing the authorization code theft chain
-4. **PunchOut (OCI) procurement testing** — checkout health reveals PunchOut is active; test for unauthorized order injection via cXML
-5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
-6. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
-7. **State JWT key brute-force** — the my-pp.metro.it state JWT uses HS256; attempt key recovery with common secrets
-8. **m3t.ro URL shortener** — wildcard CORS with X-Impersonation-Session-Id, potential for abuse
+**Severity**: Medium
+**CVSS**: 5.4 (AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N)
+**Asset**: All betty shop domains (*.metro.de, *.metro.it, *.makro.es, *.metro-tr.com, *.metro.ua — in scope)
+**Type**: Security Misconfiguration (OWASP A05) — Host Header Injection
+
+### Description
+
+The Metro betty shop platform root path (`/`) blindly reflects a custom `Host` header value into a `301 Moved Permanently` redirect `Location` header. When an attacker-controlled Host header is sent, the server responds with `Location: https://<attacker-domain>:443/shop`, enabling potential phishing and credential harvesting attacks when combined with social engineering. This affects ALL production and pre-production betty shop domains across the entire international deployment.
+
+### Evidence
+
+**Confirmed on 5 domains spanning 4 countries + pre-prod:**
+
+```bash
+# Germany (production)
+curl -sk -D- -o /dev/null "https://lieferservice.metro.de/" -H "Host: evil.com"
+HTTP/2 301
+location: https://evil.com:443/shop
+cache-control: private
+
+# Italy (production)
+curl -sk -D- -o /dev/null "https://consegne.metro.it/" -H "Host: evil.com"
+HTTP/2 301
+location: https://evil.com:443/shop
+cache-control: private
+
+# Turkey (production)
+curl -sk -D- -o /dev/null "https://horeca-dagitim.metro-tr.com/" -H "Host: evil.com"
+HTTP/2 301
+location: https://evil.com:443/shop
+cache-control: private
+
+# Spain (production)
+curl -sk -D- -o /dev/null "https://tienda.makro.es/" -H "Host: evil.com"
+HTTP/2 301
+location: https://evil.com:443/shop
+cache-control: private
+
+# Ukraine (pre-prod)
+curl -sk -D- -o /dev/null "https://dostavka-pp.metro.ua/" -H "Host: evil.com"
+HTTP/2 301
+location: https://evil.com:443/shop
+cache-control: private
+```
+
+**CRLF injection not possible** — the server strips CRLF sequences from the Host header.
+
+**Port injection partially mitigated** — `Host: lieferservice.metro.de:1337` → `Location: https://lieferservice.metro.de:443/shop` (port is hardcoded to 443, not injected from Host).
+
+**Mitigating factor**: `cache-control: private` is set, reducing the risk of web cache poisoning. However, the redirect still follows the injected Host header, making it exploitable in targeted phishing scenarios.
+
+### Attack Scenario
+
+1. Attacker sets up `evil.com` with a Metro-lookalike login page
+2. Attacker sends victim a legitimate `https://lieferservice.metro.de/` link
+3. If the victim's request passes through a proxy/load balancer that allows Host header manipulation, or the attacker uses a MITM position, the victim receives a 301 redirect to `https://evil.com:443/shop`
+4. Victim sees the redirect originating from a legitimate Metro domain and trusts the destination
+5. Attacker harvests Metro employee credentials or customer login data
+
+### Impact
+
+- **Phishing enablement**: Legitimate Metro domains redirect users to attacker-controlled sites — the redirect originates from a trusted Metro URL, increasing phishing credibility
+- **Platform-wide scope**: The vulnerability exists in the Ktor (Kotlin) backend routing shared by ALL betty shop domains across 19+ countries, affecting the entire international deployment
+- **Pre-production and production**: Both production and pre-production environments are affected, meaning internal testing environments are also vulnerable
+
+### Recommendation
+
+1. Never use the `Host` header value directly in redirect `Location` headers — use a hardcoded allowlist of valid domain names per country deployment
+2. Validate the `Host` header against the expected domain name at the application layer (Ktor routing), not just at the reverse proxy level
+3. Return a 400 Bad Request for requests with an unrecognized Host header value
+
+---
+
+## Finding 36: WordPress User Enumeration and XML-RPC Multicall on metro-markets.de
+
+**Severity**: Medium
+**CVSS**: 5.3 (AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `https://metro-markets.de` (metro-markets.de — in scope)
+**Type**: Security Misconfiguration (OWASP A05) — User Enumeration + XML-RPC Abuse
+
+### Description
+
+The Metro Markets WordPress installation at `metro-markets.de` exposes multiple information disclosure and attack surface vectors:
+
+1. **User enumeration via oembed**: The WordPress oembed API endpoint (`/wp-json/oembed/1.0/embed`) leaks author usernames, enabling targeted brute-force attacks
+2. **Author ID enumeration**: WordPress author archive pages confirm 12+ valid user accounts (IDs 2-13) via HTTP 301 redirects on `/?author=N`
+3. **XML-RPC enabled with system.multicall**: The `xmlrpc.php` endpoint is active and exposes `system.multicall`, which enables amplified brute-force attacks — a single HTTP request can test hundreds of username/password combinations simultaneously
+4. **WP REST API namespace disclosure**: The `/wp-json/` endpoint reveals 16 API namespaces including plugin-specific routes (borlabs-cookie, SBR, yoast, wpml, duplicate-post), mapping the complete plugin landscape
+5. **Application passwords authentication enabled**: The REST API advertises `application-passwords` as an authentication method
+
+### Evidence
+
+**Username leak via oembed:**
+```
+GET /wp-json/oembed/1.0/embed?url=https://metro-markets.de/ HTTP/2
+Host: metro-markets.de
+
+200 OK
+{
+  "author_name": "met001-s",
+  "author_url": "https://metro-markets.de/author/met001-s/",
+  "provider_name": "METRO Markets",
+  ...
+}
+```
+
+**Author ID enumeration (12 confirmed users):**
+```
+/?author=2  → 301 (valid user)
+/?author=3  → 301 (valid user)
+...
+/?author=13 → 301 (valid user)
+/?author=14 → 200 (no such user)
+```
+
+**XML-RPC multicall exposed:**
+```xml
+POST /xmlrpc.php HTTP/2
+Host: metro-markets.de
+Content-Type: text/xml
+
+<?xml version="1.0"?>
+<methodCall>
+  <methodName>system.listMethods</methodName>
+</methodCall>
+
+Response:
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array><data>
+          <value><string>system.multicall</string></value>
+          <value><string>system.listMethods</string></value>
+          <value><string>system.getCapabilities</string></value>
+        </data></array>
+      </value>
+    </param>
+  </params>
+</methodResponse>
+```
+
+**Plugin landscape exposed via REST API namespaces:**
+```json
+"namespaces": [
+  "oembed/1.0", "wpml/v1", "borlabs-cookie/v1",
+  "SBR/v1", "simple-page-ordering/v1", "yoast/v1",
+  "wp/v2", "wpml/st/v1", "wpml/tm/v1", "wpml/ate/v1",
+  "duplicate-post/v1", "otgs/installer/v1", "mcp",
+  "wp-site-health/v1", "wp-block-editor/v1", "wp-abilities/v1"
+]
+```
+
+**Detected plugin versions (from page source):**
+- wp-media-folder 6.2.8
+- reviews-feed (SBR) 2.13.0
+- instagram-feed 6.13.0
+- custom-twitter-feeds 2.9.0
+- custom-facebook-feed 4.13.0
+- borlabs-cookie 3.4.2.2
+- PersonioWP 1.0.0
+- Yoast SEO (latest)
+- WPML (translation management)
+- 360vier custom theme
+
+### Impact
+
+- **Credential attacks**: Combined username enumeration (via oembed) with XML-RPC `system.multicall` enables efficient brute-force attacks against WordPress admin accounts — `system.multicall` can test 500+ password combinations per HTTP request, bypassing standard rate limiting
+- **Plugin vulnerability targeting**: Exact version numbers for 10+ plugins allow attackers to search for known CVEs and exploit vulnerable plugin versions
+- **Account compromise preparation**: The `met001-s` username pattern suggests an internal naming convention (metro employee ID) — attackers can enumerate or predict additional usernames
+- **Application password abuse**: With application passwords enabled, a brute-forced password could be used to generate API-only authentication tokens without triggering 2FA
+
+### Recommendation
+
+1. Disable XML-RPC entirely (or restrict to known IP ranges) — use `.htaccess` or nginx rules to block `/xmlrpc.php`
+2. Disable the oembed endpoint or filter `author_name` and `author_url` from responses
+3. Block author enumeration by redirecting all `/?author=N` requests to the homepage
+4. Remove plugin version numbers from public HTML source
+5. Restrict the WP REST API to authenticated users only for non-public namespaces
+6. Consider a Web Application Firewall (WAF) rule to block XML-RPC brute-force patterns
+
+---
+
+## Next Steps (Phase 14)
+
+1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform
+2. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
+3. **Open redirect chaining with Finding 15** — complete the authorization code theft chain
+4. **WordPress plugin CVE testing** — check detected plugin versions on metro-markets.de for known vulnerabilities
+5. **Subdomain enumeration** on 10 in-scope wildcard domains
+6. **service-aftersales-v2 deeper testing** — Laravel app with wildcard CORS and session cookies
+7. **m3t.ro URL shortener** — wildcard CORS with X-Impersonation-Session-Id
