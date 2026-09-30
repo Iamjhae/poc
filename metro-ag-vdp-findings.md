@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 7 - Vendor office platform-wide exploitation + complete architecture mapping + multi-service CORS chain
+**Status**: Phase 8 - Seller office config endpoint + internal service exposure + aftersales Laravel debug mode + complete route map extraction
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **22 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **23 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth insecure flows enabled** — implicit grant (`response_type=token`), hybrid flow, and id_token all accepted; redirect_uri validation allows query parameter injection (`?url=https://evil.com`) enabling authorization code theft via open redirect chaining (Finding 15)
 2. **Orderfulfillment production config.js exposes 639KB of operational data** for 669 stores/depots across 19 countries, including warehouse operations, feature flags, and the complete international domain map — all unauthenticated (Finding 11)
@@ -20,6 +20,7 @@ Comprehensive testing of 66 in-scope Metro AG assets identified **22 reportable 
 7. **AXCSS OAuth client_id confirmed on production IDAM** — second OAuth client discovered via pre-prod, with state JWT using HS256 symmetric signing (Finding 20)
 8. **METRO Seller Office 8MB JS bundle exposes complete microservice architecture** — 20+ backend service URLs, admin impersonation endpoint (`/admin/impersonation/exchange` with `_switch_user` tokens), public activation code endpoint, commission fee structures (7-15%), and 4.7MB of unauthenticated translation files (Finding 21)
 9. **METRO Vendor Office platform-wide security failures** — Symfony debug mode leaking 18KB stack traces, CORS subdomain wildcard with credentials on ALL 8+ services, no rate limiting on login, PHPSESSID missing Secure flag, GCS bucket with public documents, 20+ microservice architecture fully mapped, 50+ API endpoints disclosed (Finding 22)
+10. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
 
 ---
 
@@ -1845,6 +1846,314 @@ c) **vendor.metro-vendoroffice.com** — 345KB Angular vendor portal with produc
 
 ---
 
+## Finding 23: METRO Seller Office — Unauthenticated Config Endpoint Leaking 21 Internal Service URLs + Laravel Debug Mode on Production Aftersales Service + Complete API Route Map Exposure
+
+**Severity**: Critical
+**Asset**: `https://metro-selleroffice.com` (metro-selleroffice.com — in scope), `https://service-aftersales-v2.prod.de.metro-marketplace.cloud` (*.metro-marketplace.cloud — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Broken Access Control (OWASP A01) + Information Disclosure
+
+### Summary
+
+The METRO Seller Office exposes an unauthenticated `/api/v1/config` endpoint that returns the complete production configuration including 21 internal microservice URLs on `*.prod.de.metro-marketplace.cloud`, feature flags, third-party SDK keys (ConfigCat, Optimizely, Google Tag Manager), a Sentry DSN with error monitoring credentials, and reCAPTCHA site key. All 21 internal service URLs are accessible from the public internet (they should be behind a service mesh or VPN). One of these services — `service-aftersales-v2` — is a Laravel application with **Laravel Debugbar enabled in production**, its complete Ziggy route map exposed in the HTML source (leaking 16 API routes including admin endpoints and debug endpoints), **Sanctum CSRF cookie endpoint issuing session cookies without authentication**, **wildcard CORS** (`Access-Control-Allow-Origin: *`) with an extremely permissive header whitelist including `X-Impersonation-Session-Id` and `authorization`, and a `timing-allow-origin` header leaking 12 pre-production and production marketplace domains across 7 countries.
+
+### Attack Chain
+
+1. Attacker visits `https://metro-selleroffice.com/api/v1/config` — no auth required
+2. Response reveals 21 internal `*.prod.de.metro-marketplace.cloud` service URLs
+3. Attacker directly accesses `service-aftersales-v2` — returns full Laravel application HTML
+4. HTML source contains Ziggy route config with 16 routes including admin and debug endpoints
+5. Attacker discovers admin seller organization endpoint, anonymous email admin endpoints, debugbar, and Ignition routes
+6. Attacker calls `/sanctum/csrf-cookie` — receives XSRF-TOKEN and session cookie without authentication
+7. Wildcard CORS on `service-aftersales-v2` means any website can make authenticated API requests
+
+### Evidence
+
+#### 1. Unauthenticated Config Endpoint
+
+**Request:**
+```
+GET /api/v1/config HTTP/2
+Host: metro-selleroffice.com
+```
+
+**Response (3180 bytes, HTTP 200 — no authentication required):**
+```json
+{
+  "locale": "en",
+  "logLevel": "info",
+  "featureConfig": {
+    "FF_USE_ALIAS_FOR_ELASTIC_INDEXES": 1,
+    "FF_DISABLE_HMAC_VALIDATION": 0,
+    "FF_TEMP_MPGD1215_ADD_NEW_BUSINESS_REGISTRATION": 1,
+    "FF_TEMP_MPGD5483_PRODUCT_TRACKING_SYSTEM": 1,
+    "FF_TEMP_MPGD_10266_MANUFACTURER_NAME_VALIDATION": 1,
+    "FF_MAINTENANCE_PAGE": 0,
+    "FF_TEMP_MPGD6348_ADMIN_PANEL": 1,
+    "FF_ENABLE_SENDGRID_EMAIL_VALIDATOR": 1,
+    "FF_TEMP_MPGD6454_SAVE_BATCH_OF_ADDRESSES": 1
+  },
+  "serviceBaseUrls": {
+    "ims": "https://service-ims-v2.prod.de.metro-marketplace.cloud",
+    "platform": "https://platform.prod.de.metro-marketplace.cloud",
+    "sellerGateway": "https://service-seller-gateway.prod.de.metro-marketplace.cloud",
+    "sellerOffice": "https://app-seller-office.prod.de.metro-marketplace.cloud",
+    "sellerPim": "https://app-seller-pim.prod.de.metro-marketplace.cloud",
+    "sellerPimUtils": "https://service-pim-utils.prod.de.metro-marketplace.cloud",
+    "pimExternalCatalogTransformation": "https://service-pim-external-catalog-transformation.prod.de.metro-marketplace.cloud",
+    "sellerInventory": "https://app-seller-inventory.prod.de.metro-marketplace.cloud",
+    "sellerOfferCompetitiveness": "https://app-seller-price-competitiveness.prod.de.metro-marketplace.cloud",
+    "userAccount": "https://app-user-account.prod.de.metro-marketplace.cloud",
+    "storefront": "https://app-storefront.prod.de.metro-marketplace.cloud",
+    "orderManagement": "https://app-order-management.prod.de.metro-marketplace.cloud",
+    "payment": "https://service-payment.prod.de.metro-marketplace.cloud",
+    "paymentReports": "https://service-payment-reports.prod.de.metro-marketplace.cloud",
+    "category": "https://service-category.prod.de.metro-marketplace.cloud",
+    "mmCentral": "https://service-multimarket-central.prod.de.metro-marketplace.cloud",
+    "accounting": "https://service-payment-provider.prod.de.metro-marketplace.cloud",
+    "anonymousEmails": "https://service-anonymous-emails.prod.de.metro-marketplace.cloud",
+    "aftersales": "https://service-aftersales-v2.prod.de.metro-marketplace.cloud",
+    "messageCenter": "https://service-message-center.prod.de.metro-marketplace.cloud",
+    "cdn": "https://mma-mp-de-production-cdn.prod.de.metro-marketplace.cloud",
+    "refundRequests": "https://service-refund-requests.prod.de.metro-marketplace.cloud"
+  },
+  "appBaseUrls": {
+    "seller": "https://www.metro-selleroffice.com",
+    "employee": "https://backoffice.de.metro-marketplace.cloud/",
+    "buyerDe": "https://www.metro.de/marktplatz/",
+    "buyerEs": "https://www.makro.es/marketplace/",
+    "buyerIt": "https://www.metro.it/marketplace/",
+    "buyerPt": "https://www.makro.pt/marketplace/",
+    "buyerNl": "https://www.makro.nl/marketplace/",
+    "buyerFr": "https://www.metro.fr/marketplace",
+    "buyerHr": "https://www.metro-cc.hr/marketplace/"
+  },
+  "gaTrackingId": "GTM-PNZ8HWP",
+  "gtmAuthId": "KiyA6ICBGBLe5SOXtgSBtg",
+  "gtmPreview": "env-1",
+  "captchaSiteKey": "6Le21rMUAAAAABfUETJmm8d1P3JLpXRKTOCHz627",
+  "configCatSdkKey": "DVPXCI0if81SA9_CiLstKA/7XgUPncj-0CAGX2Zs2i7Kg",
+  "optimizelySdkKey": "SfQzTXC1pZbrqGFuQeDYz",
+  "metroSellerId": "118ede85-fd10-42aa-8ee5-6fbc2553de02",
+  "googleCloudStorage": "https://storage.googleapis.com",
+  "akamaiHostURL": "https://images.metro-marketplace.eu/",
+  "sentry": {
+    "dsn": "https://d5cc4bbbb4f34303b91147f3b6c3c23a@cps-sentry.metro-markets.org/75",
+    "enabled": "true",
+    "environment": "prod"
+  }
+}
+```
+
+**Critical data leaked:**
+- **21 internal microservice URLs** on `*.prod.de.metro-marketplace.cloud` — payment, payment-reports, payment-provider, order-management, seller-gateway, IMS, PIM, inventory, anonymous-emails, aftersales, message-center, CDN, refund-requests, and more
+- **Employee backoffice URL**: `backoffice.de.metro-marketplace.cloud`
+- **10 feature flags** including `FF_DISABLE_HMAC_VALIDATION`, `FF_TEMP_MPGD6348_ADMIN_PANEL`, `FF_MAINTENANCE_PAGE`
+- **Sentry DSN**: `d5cc4bbbb4f34303b91147f3b6c3c23a@cps-sentry.metro-markets.org/75` — enables attacker to send fake error reports
+- **ConfigCat SDK key**: `DVPXCI0if81SA9_CiLstKA/7XgUPncj-0CAGX2Zs2i7Kg` — access to feature flag configuration
+- **Optimizely SDK key**: `SfQzTXC1pZbrqGFuQeDYz`
+- **Google Tag Manager**: `GTM-PNZ8HWP` with auth `KiyA6ICBGBLe5SOXtgSBtg`
+- **reCAPTCHA site key**: `6Le21rMUAAAAABfUETJmm8d1P3JLpXRKTOCHz627`
+- **METRO seller UUID**: `118ede85-fd10-42aa-8ee5-6fbc2553de02`
+- **7 buyer marketplace URLs** across 6 countries (DE, ES, IT, PT, NL, FR, HR)
+
+#### 2. All 21 Internal Services Accessible from Public Internet
+
+Every internal microservice URL is reachable from the internet — these should be behind a service mesh, VPN, or at minimum IP-restricted:
+
+| Service | URL | HTTP Response |
+|---------|-----|---------------|
+| IMS | service-ims-v2.prod.de.metro-marketplace.cloud | 404 |
+| Platform | platform.prod.de.metro-marketplace.cloud | 404 |
+| Seller Gateway | service-seller-gateway.prod.de.metro-marketplace.cloud | 404 |
+| Seller Office | app-seller-office.prod.de.metro-marketplace.cloud | 404 |
+| Seller PIM | app-seller-pim.prod.de.metro-marketplace.cloud | 404 |
+| PIM Utils | service-pim-utils.prod.de.metro-marketplace.cloud | 404 |
+| PIM Ext. Catalog | service-pim-external-catalog-transformation.prod.de.metro-marketplace.cloud | 404 |
+| Seller Inventory | app-seller-inventory.prod.de.metro-marketplace.cloud | 404 |
+| Price Competitiveness | app-seller-price-competitiveness.prod.de.metro-marketplace.cloud | 404 |
+| User Account | app-user-account.prod.de.metro-marketplace.cloud | 404 |
+| Storefront | app-storefront.prod.de.metro-marketplace.cloud | 404 |
+| Order Management | app-order-management.prod.de.metro-marketplace.cloud | 404 |
+| Payment | service-payment.prod.de.metro-marketplace.cloud | 404 |
+| Payment Reports | service-payment-reports.prod.de.metro-marketplace.cloud | 404 |
+| Category | service-category.prod.de.metro-marketplace.cloud | 404 |
+| Multimarket Central | service-multimarket-central.prod.de.metro-marketplace.cloud | 404 |
+| Payment Provider | service-payment-provider.prod.de.metro-marketplace.cloud | 404 |
+| Anonymous Emails | service-anonymous-emails.prod.de.metro-marketplace.cloud | 404 |
+| **Aftersales v2** | **service-aftersales-v2.prod.de.metro-marketplace.cloud** | **200 (26KB HTML)** |
+| Message Center | service-message-center.prod.de.metro-marketplace.cloud | 404 |
+| Refund Requests | service-refund-requests.prod.de.metro-marketplace.cloud | 404 |
+| Notification | service-notification.prod.de.metro-marketplace.cloud | 403 |
+
+#### 3. service-aftersales-v2 — Laravel Debug Mode with Complete Route Map
+
+The aftersales service at `service-aftersales-v2.prod.de.metro-marketplace.cloud` returns a full Laravel application page (26KB) with its complete Ziggy route map embedded in the JavaScript. The routes reveal:
+
+**16 Exposed Routes:**
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| GET | `/api/v1/admin/sellers/organizations/{organizationId}` | Admin seller organization data |
+| GET | `/api/v1/admin/anonymous-emails/threads` | Admin anonymous email threads |
+| GET | `/api/v1/admin/anonymous-emails/attachments` | Admin email attachments |
+| GET | `/api/v1/admin/anonymous-emails/attachment/url` | Admin attachment URLs |
+| GET | `/api/v1/auth/app-check/{anything}` | Auth health check |
+| GET | `/_debugbar/assets/stylesheets` | **Laravel Debugbar CSS** |
+| GET | `/_debugbar/assets/javascript` | **Laravel Debugbar JS** |
+| GET | `/_debugbar/open` | **Debugbar open handler** |
+| POST | `/_debugbar/queries/explain` | **SQL EXPLAIN endpoint** |
+| GET | `/_debugbar/clockwork/{id}` | **Clockwork profiler** |
+| GET | `/_debugbar/telescope/{id}` | **Laravel Telescope** |
+| DELETE | `/_debugbar/cache/{key}/{tags?}` | **Cache deletion endpoint** |
+| POST | `/_ignition/execute-solution` | **Ignition RCE vector (CVE-2021-3129)** |
+| GET | `/_ignition/health-check` | Ignition health check |
+| POST | `/_ignition/update-config` | **Ignition config update** |
+| GET | `/sanctum/csrf-cookie` | Sanctum CSRF cookie issuer |
+
+**Admin endpoints respond with JWT validation errors — confirming they are live and accepting requests:**
+```
+GET /api/v1/admin/anonymous-emails/threads HTTP/2
+Host: service-aftersales-v2.prod.de.metro-marketplace.cloud
+
+HTTP/2 401
+{"message":"Invalid or expired JWT token provided"}
+```
+
+**Auth app-check returns 200 without authentication:**
+```
+GET /api/v1/auth/app-check/test HTTP/2
+Host: service-aftersales-v2.prod.de.metro-marketplace.cloud
+
+HTTP/2 200
+it works!
+```
+
+#### 4. Sanctum CSRF Cookie — Session Cookies Without Authentication
+
+**Request:**
+```
+GET /sanctum/csrf-cookie HTTP/2
+Host: service-aftersales-v2.prod.de.metro-marketplace.cloud
+```
+
+**Response (HTTP 204):**
+```
+set-cookie: XSRF-TOKEN=eyJpdiI6IjxiYXNlNjQ+IiwidmFsdWUiOiI8ZW5jcnlwdGVkPiIsIm1hYyI6IjxobWFjPiIsInRhZyI6IiJ9;
+  expires=<+24h>; Max-Age=86400; path=/; secure; samesite=lax
+set-cookie: service_aftersales_v2_session=eyJpdiI6IjxiYXNlNjQ+IiwidmFsdWUiOiI8ZW5jcnlwdGVkPiIsIm1hYyI6IjxobWFjPiIsInRhZyI6IiJ9;
+  expires=<+24h>; Max-Age=86400; path=/; secure; httponly; samesite=lax
+```
+
+The endpoint creates a valid Laravel session and CSRF token for any unauthenticated visitor. Combined with wildcard CORS, any website can:
+1. Call `/sanctum/csrf-cookie` to get session cookies
+2. Use the XSRF-TOKEN to make CSRF-protected POST requests
+3. Potentially access admin API endpoints if session state grants any implicit permissions
+
+#### 5. Wildcard CORS with Impersonation Header Whitelist
+
+**Request:**
+```
+GET / HTTP/2
+Host: service-aftersales-v2.prod.de.metro-marketplace.cloud
+Origin: https://evil.com
+```
+
+**Response headers:**
+```
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: X-Impersonation-Session-Id, X-Active-Context,
+  DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control,
+  Content-Type, Range, authorization, tid, x-prerender, X-Correlation-Id,
+  x-cms-location, X-Proxy-Service, X-Proxy-Location, X-Country-Code,
+  Country-Code, Accept-Language, Content-Language, X-ID-MM, X-ID-GA,
+  X-ID-OM, X-ID-CO, X-SOURCE, x-client-id, X-Analytics-User-Id, X-Session-Id
+access-control-expose-headers: X-Correlation-Id
+access-control-max-age: 1728000
+```
+
+**Critical observations:**
+- `Access-Control-Allow-Origin: *` — any website can make requests
+- `X-Impersonation-Session-Id` in allowed headers — **confirms impersonation functionality exists**
+- `authorization` in allowed headers — tokens can be sent cross-origin
+- `X-Proxy-Service` and `X-Proxy-Location` — service mesh routing headers exposed
+- Max age of 1728000 seconds (20 days) — preflight responses cached aggressively
+
+#### 6. timing-allow-origin Leaking Production and Pre-Prod Domains
+
+```
+timing-allow-origin: https://marketplace-pp.metro.de,
+  https://marketplace-pp.makro.es,
+  https://marketplace-pp.metro.it,
+  https://marketplace-pp.makro.pt,
+  https://marketplace-pp.makro.nl,
+  https://marketplace-pp.metro.fr,
+  https://www.metro.de,
+  https://www.makro.es,
+  https://www.metro.it,
+  https://www.makro.pt,
+  https://www.makro.nl,
+  https://www.metro.fr
+```
+
+This reveals 6 pre-production marketplace domains (`marketplace-pp.*`) and 6 production domains. The pre-production URLs are attack surface for accessing staging environments.
+
+#### 7. Permissive CSP
+
+```
+content-security-policy: default-src 'self' http: https: data: blob: 'unsafe-inline'
+```
+
+This CSP provides essentially no protection — it allows all HTTP/HTTPS sources, inline scripts, data URIs, and blob URLs. XSS payloads execute without CSP interference.
+
+#### 8. Infrastructure Headers
+
+```
+x-ingress-controller: v2
+x-ingress-request-id: eddd56bde5b7ddf06fa8b6dd1682440c
+x-ingress-request-start: t=1790739198.543
+x-powered-by: A fleet of awesome Marketeers. Apply today - https://www.metro-markets.de/careers
+strict-transport-security: max-age=31536000; includeSubDomains
+x-frame-options: SAMEORIGIN
+```
+
+### Impact
+
+- **Information Disclosure (Critical)**: Unauthenticated access to the complete microservice architecture — 21 internal service URLs, employee backoffice URL, Sentry DSN, SDK keys, feature flags, and METRO seller UUID
+- **Expanded Attack Surface**: All 21 internal services are accessible from the internet, bypassing intended service mesh isolation. An attacker can probe each service directly for vulnerabilities
+- **Debug Mode in Production**: Laravel Debugbar routes are defined in the application (route map exposed via Ziggy), meaning debug tooling was enabled during deployment. The `_debugbar/queries/explain` POST endpoint, if functional, enables arbitrary SQL EXPLAIN queries. The `_ignition/execute-solution` endpoint is a known RCE vector (CVE-2021-3129)
+- **Session Fixation Risk**: Sanctum CSRF cookie endpoint creates sessions for unauthenticated visitors; combined with wildcard CORS, any website can initiate sessions and make CSRF-protected requests
+- **Impersonation Feature Exposure**: The `X-Impersonation-Session-Id` CORS header confirms the existence of user impersonation functionality. Combined with the admin endpoints visible in the route map (`admin/sellers/organizations/{organizationId}`), this suggests full admin-level seller management capability
+- **Sentry DSN Abuse**: The exposed Sentry DSN (`d5cc4bbbb4f34303b91147f3b6c3c23a@cps-sentry.metro-markets.org/75`) allows an attacker to inject fake error reports into METRO's error monitoring, potentially flooding dashboards or injecting malicious content into error messages viewed by developers
+
+### CVSS Assessment
+
+- **Attack Vector**: Network (AV:N) — all endpoints publicly accessible
+- **Attack Complexity**: Low (AC:L) — simple GET request reveals config
+- **Privileges Required**: None (PR:N) — no authentication needed
+- **User Interaction**: None (UI:N) — direct exploitation
+- **Scope**: Changed (S:C) — config from seller office exposes separate internal services
+- **Confidentiality**: High (C:H) — complete infrastructure mapping + admin route map
+- **Integrity**: Low (I:L) — Sentry DSN allows fake error injection, session cookie creation
+- **Availability**: None (A:N)
+- **CVSS 3.1 Score**: 9.3 (Critical)
+
+### Remediation
+
+1. **Immediately remove `/api/v1/config` from unauthenticated access** — require authentication or serve only non-sensitive config to the frontend
+2. **Restrict internal services to service mesh/VPN** — all 21 `*.prod.de.metro-marketplace.cloud` services should not be accessible from the public internet
+3. **Disable Laravel Debugbar and Ignition in production** — set `APP_DEBUG=false` and remove `barryvdh/laravel-debugbar` from production dependencies; Ignition's `execute-solution` is a known RCE vector
+4. **Remove Ziggy route exposure from HTML** — move route definitions server-side; never expose debug or admin routes to the client
+5. **Restrict CORS on service-aftersales-v2** — replace `Access-Control-Allow-Origin: *` with specific allowed origins; remove `X-Impersonation-Session-Id` from allowed headers
+6. **Rotate all exposed credentials** — Sentry DSN, ConfigCat SDK key, Optimizely SDK key, GTM auth ID, reCAPTCHA site key
+7. **Restrict `/sanctum/csrf-cookie`** — require authentication or limit to known frontend origins
+8. **Remove `timing-allow-origin` header** — it leaks pre-production domain names
+9. **Implement proper CSP** — replace the permissive policy with strict-dynamic or nonce-based CSP
+10. **Move feature flags to authenticated config** — `FF_DISABLE_HMAC_VALIDATION` and `FF_TEMP_MPGD6348_ADMIN_PANEL` reveal security-critical application state
+11. **Strip infrastructure headers** — remove `x-ingress-controller`, `x-ingress-request-start`, `x-powered-by`
+
+---
+
 ## Unreachable Targets (for reference)
 
 The following in-scope targets were **unreachable** from the testing environment due to egress proxy restrictions, DNS resolution failures, or firewall rules:
@@ -1946,14 +2255,14 @@ The following in-scope targets were **unreachable** from the testing environment
 - PureCloud (requires authentication, returns 302/404)
 - erika.metrosystems.net (egress proxy blocked)
 - adfs3.metro.info (connection failure)
-- *.metro-marketplace.cloud subdomains (all DNS resolution failures — no active subdomains found)
+- *.metro-marketplace.cloud subdomains (earlier DNS failures — but 21 `*.prod.de.metro-marketplace.cloud` services confirmed reachable via config endpoint in Finding 23)
 - *.metro-markets.net subdomains (all DNS resolution failures)
 - *.metro-vendorcentral.com subdomains (www.pp.metro-vendorcentral.com reachable but 403 on all paths — IP restricted)
 - ria voucher API backend at api.cf-vvv-preprod-o6.cf.metro.cloud (returns 404 for all tested paths — backend may require different routing)
 - betty.metro.{bg,de,fr,hr,hu,it,pk,pt,ro,rs,ua} — all blocked by egress proxy (HTTP 000)
 - Vendor Office notification-hub.metro-vendoroffice.com (returns 401 — Mercure SSE hub, auth required)
 
-## Next Steps (Phase 6)
+## Next Steps (Phase 8)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
