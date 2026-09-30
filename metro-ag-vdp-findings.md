@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **27 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **28 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -2818,6 +2818,108 @@ theme_id = '79315153cb33310000f8d856634c9c4b'
 3. Consider enabling the ServiceNow "High Security" plugin which restricts these endpoints by default
 4. Review and rotate the Azure AD tenant configuration if it was intended to be internal-only
 5. Ensure the guest user ID is not reused across instances to prevent cross-instance correlation
+
+---
+
+## Finding 28: Price Backoffice Pre-Production — Publicly Accessible with Unauthenticated Config API and Deprecated OAuth Flow
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `md.betty-pp.metrosystems.net` (betty.metrosystems.net — in scope)
+**Type**: Security Misconfiguration (OWASP A05) + Broken Authentication (OWASP A07)
+
+### Description
+
+The Metro AG pre-production price backoffice application at `md.betty-pp.metrosystems.net/price.backoffice/` is publicly accessible on the internet. The application's backend-for-frontend (BFF) exposes an unauthenticated configuration endpoint that leaks the pre-production IDAM URL. Furthermore, the application uses the deprecated OAuth 2.0 implicit grant flow (`response_type=token`) without PKCE, violating RFC 9700 security requirements.
+
+### Evidence
+
+#### 28a. Publicly Accessible Pre-Production Application
+
+```
+GET /price.backoffice/ HTTP/2
+Host: md.betty-pp.metrosystems.net
+
+200 OK
+Content-Type: text/html; charset=utf-8
+```
+
+The application is a React SPA (1.8MB JS bundle) for managing pricing across Metro AG's international operations, supporting 14 currencies (EUR, TRY, PLN, RUB, HUF, KZT, UAH, BGN, HRK, CZK, MDL, PKR, RON, RSD, SKK, INR).
+
+#### 28b. Unauthenticated Configuration API Leaks IDAM Pre-Production URL
+
+```
+GET /price.bff/config HTTP/2
+Host: md.betty-pp.metrosystems.net
+CallTreeId: test-123
+
+200 OK
+{"idam":{"url":"https://idam-pp.metrosystems.net"}}
+```
+
+This exposes the pre-production IDAM instance URL without any authentication — only a `CallTreeId` header (any value accepted) is required.
+
+#### 28c. OAuth Implicit Flow (RFC 9700 Violation)
+
+The JS bundle reveals the authentication configuration:
+```javascript
+response_type: "token",       // Implicit grant — DEPRECATED
+realm_id: "BETTY_REALM",      // Internal realm name
+client_id: "BTEX",            // Client ID exposed
+user_type: "EMP",             // Employee authentication
+scope: "openid clnt=BTEX",
+max_age: 86400
+```
+
+The implicit flow transmits access tokens in URL fragments, which:
+- Are stored in browser history
+- Leak via Referer headers
+- Cannot use refresh tokens for session management
+- Violate RFC 9700 Section 2.1.2 (implicit grant MUST NOT be used)
+
+#### 28d. Complete Backend API Surface Exposed
+
+The JS bundle discloses 12+ BFF API endpoints:
+```
+/price.bff/config          — Configuration (unauthenticated!)
+/price.bff/login           — Login endpoint (POST)
+/price.bff/list            — Price list management (POST)
+/price.bff/articleData     — Article pricing data (POST)
+/price.bff/customer/       — Customer-specific pricing
+/price.bff/deliveryFees/   — Delivery fee management
+/price.bff/fsd-init-price/ — FSD initialization pricing
+/price.bff/order           — Order management
+/price.bff/updateDeliveryFees/ — Delivery fee updates
+/price.bff/mov-config/     — MOV configuration
+/price.bff/df-config/      — Delivery fee configuration
+/price.bff/developer       — Developer mode toggle
+```
+
+#### 28e. Google Tag Manager on Pre-Production
+
+```html
+<script>
+  j.src = 'https://www.googletagmanager.com/gtm.js?id=GTM-P2JW77JN';
+</script>
+```
+
+GTM tracking on a pre-production system sends analytics data about internal employee usage patterns to Google.
+
+### Impact
+
+- **Pre-production environment exposure**: Internal pricing tool accessible from the internet, providing attackers a testing ground without production monitoring
+- **IDAM pre-production targeting**: The leaked `idam-pp.metrosystems.net` URL enables attacks against the pre-production identity platform
+- **Employee credential theft**: The implicit flow makes employee access tokens susceptible to interception via Referer leakage or browser history
+- **API attack surface**: 12+ backend endpoints for pricing, delivery fees, and order management are mapped for targeted attacks
+- **Business intelligence**: Currency list and pricing model reveal Metro AG's complete international pricing infrastructure
+
+### Recommendation
+
+1. Restrict `md.betty-pp.metrosystems.net` access via VPN or IP allowlisting — pre-production should not be internet-facing
+2. Migrate from OAuth implicit flow to authorization code flow with PKCE (per RFC 9700)
+3. Require authentication for the `/price.bff/config` endpoint
+4. Remove Google Tag Manager from pre-production environments
+5. Validate the `CallTreeId` header rather than accepting any arbitrary value
 
 ---
 
