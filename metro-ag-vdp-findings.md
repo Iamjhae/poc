@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 12 - Source maps exposure + continued deep probing
+**Status**: Phase 13 - Order fulfillment backoffice exposure + continued deep probing
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **33 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **34 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3318,15 +3318,149 @@ service-seller-gateway is ready.
 
 ---
 
-## Next Steps (Phase 12)
+## Finding 34: Order Fulfillment Backoffice UI Exposed on All Shop Domains
+
+**Severity**: Medium
+**CVSS Score**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: `https://consegne.metro.it/orderfulfillment.uidispatcher.static/` (*.metro.it, *.metro.de, *.makro.es, *.metro-tr.com, *.metro.rs — all in scope)
+**Category**: Information Disclosure — Internal Application Exposure
+
+### Description
+
+The Order Fulfillment / Pick and Pack / Depot Management backoffice application is publicly accessible at `/orderfulfillment.uidispatcher.static/` on ALL production shop domains. This internal warehouse operations application serves its complete client-side code (3.6MB+ JavaScript), operational configuration (639KB config.js with 669 depot entries across 19 countries), and the full i18n translation corpus — all without any authentication.
+
+### Evidence
+
+**Discovery — backoffice app accessible on production shop domain:**
+```
+GET /orderfulfillment.uidispatcher.static/ HTTP/2
+Host: consegne.metro.it
+200 OK
+
+Response loads a complete separate application with:
+- /pickandpack/ofui/app/scripts.js (1.37MB)
+- /depotmanagement/ui/app/scripts.js (2.29MB)
+- /ordermanagement/navbarui/app/scripts.js
+- /orderfulfillment.uidispatcher.static/app/config.js (639KB)
+- /orderfulfillment.uidispatcher.static/app/api.js
+```
+
+**Cross-domain confirmation:**
+```
+consegne.metro.it        → 200 (contains "pickandpack")
+lieferservice.metro.de   → 200 (contains "pickandpack")
+horeca-dagitim.metro-tr.com → 200 (contains "pickandpack")
+tienda.makro.es          → 200 (contains "pickandpack")
+online.metro.rs          → 200 (contains "pickandpack")
+```
+
+**config.js — 669 depot configurations across 19 countries:**
+```
+AT: 1 depot    BG: 11 depots   CZ: 13 depots   DE: 120 depots
+ES: 42 depots  FR: 201 depots  HR: 8 depots     HU: 13 depots
+IT: 72 depots  KZ: 13 depots   MD: 2 depots     NL: 10 depots
+PL: 57 depots  PT: 10 depots   RO: 27 depots    RS: 9 depots
+SK: 10 depots  TR: 33 depots   UA: 17 depots
+
+Example entry (DE_STOREDEPOT_00528):
+  locationType: "depot"
+  handledAssortmentAreas: DANGEROUS_GOODS, DEEP_FROZEN, DRINKS,
+    FISH, FRUITS_VEGETABLES, MEAT, MEAT_CUT, MAIN_TOP_SELLER
+  flexibleWaveDetails: slotCleanupInterval=3, proposalType=dynamic_tour_space_driven
+  landingPageMenuItems: CONSOLIDATION, QUICK_CONSOLIDATION,
+    PAM_BETA, PICKING_QUALITY_CONTROL
+```
+
+**Internal HTML configuration variables exposed:**
+```javascript
+window.idam_login_base_url = "https://idam.metrosystems.net"
+window.erikaBaseUrl = "https://erika.metrosystems.net"
+window.clickAndCollectEnabledCountries = "DE,ES,FR,PT,NL,PL,KZ,PK"
+window.dropshipmentEnabledCountries = "FR,DE,ES,RO"
+window.manualPriceChangeForEcommerceAllowed = "true"
+window.oomFiscalReceiptCountries = "PL,MD,KZ"
+window.priceApprovalNotNecessary = "DE"
+```
+
+**ADFS OAuth2 client ID and employee authentication flow exposed:**
+```javascript
+// Employee login redirect (from api.js)
+https://adfs3.metro.info/adfs/oauth2/authorize
+  ?resource={origin_url}
+  &response_type=code
+  &client_id=e595352d-d1df-4a9a-a469-d33bb5c46ef3
+  &redirect_uri={origin_url}
+```
+
+**60+ internal API endpoints revealed:**
+```
+/ordermanagement/orderservice/order
+/ordermanagement/orderservice/picklist/prepick
+/ordermanagement/orderservice/shipments
+/ordermanagement/orderservice/sscc
+/depotmanagement/stocklocation/location/
+/depotmanagement/goodsreceivingservice
+/depotmanagement/employeeservice
+/depotmanagement/gateway/slm/stock
+/depotmanagement/reservations
+/depotmanagement/returns
+/depotmanagement/stockinventory
+/pickandpack.picking.v1
+/orderfulfillment.vehicleservice.v1/vehicles/truck
+/orderfulfillment.rinkai.v1/import/delete
+/ordercapture.employeeprice.v1/approvals/approvalData
+/ordercapture/login/auth/loginCustomer
+/ordercapture/login/auth/loginEmployee2
+/ordercapture/login/auth/singleSignOn
+```
+
+**Complete domain mapping for ALL countries (20+) including dev/test/staging:**
+```javascript
+DE: ["betty-pp.metrosystems.net", "lieferservice-pp.metro.de",
+     "betty-dev.metrosystems.net", "lieferservice.metro.de", ...]
+IT: ["it.betty-pp.metrosystems.net", "consegne-pp.metro.it",
+     "consegne.metro.it", "prodotti.metro.it", ...]
+FR: ["fr.betty-pp.metrosystems.net", "shop-tma-sc.metro.fr",
+     "shop.metro.fr", "livraison.metro.fr", ...]
+// ... 20+ countries with production, pre-prod, dev, test domains
+```
+
+**Authentication logic fully exposed (JWT handling, SSO, IDAM single sign-off):**
+```javascript
+// SSO endpoint
+POST /ordercapture/login/auth/singleSignOn
+→ 401 with header: www-authenticate: betty-jwt realm="Ktor Server"
+
+// JWT stored in cookies (compressedJWT) and localStorage (JWT)
+// JWT payload contains: role, customerId, cardholderNumber,
+//   employeeData, entitlements (lPM, lTM, fISTC)
+```
+
+### Impact
+
+- **Operational intelligence**: 669 depot/store configurations expose warehouse operational details including assortment handling, slot management, and wave planning for Metro's entire international delivery network
+- **Attack surface mapping**: 60+ internal API endpoint paths enable targeted attacks against warehouse management, order processing, depot stock, and employee services
+- **Infrastructure exposure**: ADFS OAuth client ID, IDAM URLs, Erika service URL, and complete domain mapping (including dev/test/staging) across 20+ countries
+- **Authentication bypass preparation**: Full JWT handling logic, login endpoint paths, and employee entitlement codes (lPM, lTM, fISTC) exposed — attackers can study and target the authentication flow
+- **Business logic leaks**: Feature flag configurations (manual price changes allowed, price approval not required in Germany, fiscal receipt countries) reveal business rules exploitable for fraud
+
+### Recommendation
+
+1. Restrict `/orderfulfillment.uidispatcher.static/` to authenticated employees only — add authentication middleware before serving this path
+2. Move depot operational configurations from client-side JavaScript to authenticated API endpoints
+3. Remove dev/test/staging domain mappings from production bundles
+4. Remove ADFS client ID from client-side code — handle employee auth redirect server-side
+5. Implement proper code splitting to avoid serving warehouse operations code to all shop visitors
+
+---
+
+## Next Steps (Phase 13)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
 3. **Open redirect chaining with Finding 15** — test if the betty SPA processes the `url` query parameter in the redirect_uri as a redirect destination, completing the authorization code theft chain
 4. **PunchOut (OCI) procurement testing** — checkout health reveals PunchOut is active; test for unauthorized order injection via cXML
-5. **Voucher app access-code brute-force** — the `/api/v1/authenticate?accessCode=` endpoint uses simple codes; test common patterns and numeric sequences on the API backend (`api.cf-vvv-preprod-o6.cf.metro.cloud`)
-6. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
-7. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
-8. **METRO Seller Office main.js analysis** — extract authentication flow, API endpoints, and seller management functionality from the Angular production bundle
-9. **State JWT key brute-force** — the my-pp.metro.it state JWT uses HS256; attempt key recovery with common secrets (requires jwt_tool or hashcat)
-10. **ria voucher lazy-loaded modules** — VoucherManagementPage and CampaignManagementPage contain additional API endpoints for voucher CRUD operations
+5. **DOM-based XSS** — thorough client-side JavaScript analysis of SPA applications for postMessage handlers, hash-fragment injection, and unsafe DOM manipulation
+6. **Subdomain enumeration** on 10 in-scope wildcard domains (requires DNS tooling like amass/subfinder)
+7. **State JWT key brute-force** — the my-pp.metro.it state JWT uses HS256; attempt key recovery with common secrets
+8. **m3t.ro URL shortener** — wildcard CORS with X-Impersonation-Session-Id, potential for abuse
