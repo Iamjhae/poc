@@ -2098,7 +2098,48 @@ timing-allow-origin: https://marketplace-pp.metro.de,
 
 This reveals 6 pre-production marketplace domains (`marketplace-pp.*`) and 6 production domains. The pre-production URLs are attack surface for accessing staging environments.
 
-#### 7. Permissive CSP
+#### 7. service-seller-gateway — Unauthenticated OpenAPI/Swagger Spec (22 Endpoints + 25 Schemas)
+
+The seller gateway at `service-seller-gateway.prod.de.metro-marketplace.cloud` redirects root to `/api/v1/api-doc` which serves a **complete OpenAPI 3.0 specification** without authentication — NelmioApiDoc Swagger UI with full request/response schemas:
+
+**Request:**
+```
+GET /api/v1/api-doc HTTP/2
+Host: service-seller-gateway.prod.de.metro-marketplace.cloud
+```
+
+**Response: HTTP 200 — Full Swagger UI with embedded spec (22 endpoints, 25 schemas)**
+
+**Exposed endpoints include:**
+- `POST /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/return-label` — upload return label PDFs
+- `PUT /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/return-trackings` — update tracking
+- `DELETE /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/documents/{documentId}` — delete documents
+- `GET /api/seller/proxy/app-order-management/v1/delivery-carriers` — list carriers
+- `GET /api/seller/proxy/service-seller-account-health/v1/kpi/{metric}` — 7 KPI metrics (order defect, delivery, cancellation, etc.)
+- `GET /api/seller/proxy/service-seller-account-health/v1/export/{kpiName}` — export KPI data
+
+**Schemas reveal internal data models:** `app-order-management_FileStorageId`, `app-order-management_TrackingPayload`, all KPI response schemas with field definitions.
+
+The gateway also reveals it is a **proxy** to internal services — all paths follow `/api/seller/proxy/{service-name}/v1/*` pattern, confirming the microservice routing architecture.
+
+Health check also exposed unauthenticated:
+```
+GET /api/v1/auth/app-check/health → "service-seller-gateway is ready."
+```
+
+#### 8. service-pim-utils — Symfony Debug Error Responses
+
+```
+GET /health HTTP/2
+Host: service-pim-utils.prod.de.metro-marketplace.cloud
+
+HTTP/2 500
+{"class":"NotFoundHttpException","code":500,"message":"No route found for \"GET https://service-pim-utils.prod.de.metro-marketplace.cloud/health\""}
+```
+
+Leaks Symfony exception class names (`NotFoundHttpException`) and internal URLs in error messages — identical pattern to Finding 22's vendor office Symfony debug mode.
+
+#### 9. Permissive CSP
 
 ```
 content-security-policy: default-src 'self' http: https: data: blob: 'unsafe-inline'
@@ -2106,7 +2147,7 @@ content-security-policy: default-src 'self' http: https: data: blob: 'unsafe-inl
 
 This CSP provides essentially no protection — it allows all HTTP/HTTPS sources, inline scripts, data URIs, and blob URLs. XSS payloads execute without CSP interference.
 
-#### 8. Infrastructure Headers
+#### 10. Infrastructure Headers
 
 ```
 x-ingress-controller: v2
@@ -2120,7 +2161,7 @@ x-frame-options: SAMEORIGIN
 ### Impact
 
 - **Information Disclosure (Critical)**: Unauthenticated access to the complete microservice architecture — 21 internal service URLs, employee backoffice URL, Sentry DSN, SDK keys, feature flags, and METRO seller UUID
-- **Expanded Attack Surface**: All 21 internal services are accessible from the internet, bypassing intended service mesh isolation. An attacker can probe each service directly for vulnerabilities
+- **Expanded Attack Surface**: All 21 internal services are accessible from the internet, bypassing intended service mesh isolation. An attacker can probe each service directly for vulnerabilities. The seller-gateway provides a complete OpenAPI spec with 22 endpoints and 25 data schemas, fully documenting the API attack surface
 - **Debug Mode in Production**: Laravel Debugbar routes are defined in the application (route map exposed via Ziggy), meaning debug tooling was enabled during deployment. The `_debugbar/queries/explain` POST endpoint, if functional, enables arbitrary SQL EXPLAIN queries. The `_ignition/execute-solution` endpoint is a known RCE vector (CVE-2021-3129)
 - **Session Fixation Risk**: Sanctum CSRF cookie endpoint creates sessions for unauthenticated visitors; combined with wildcard CORS, any website can initiate sessions and make CSRF-protected requests
 - **Impersonation Feature Exposure**: The `X-Impersonation-Session-Id` CORS header confirms the existence of user impersonation functionality. Combined with the admin endpoints visible in the route map (`admin/sellers/organizations/{organizationId}`), this suggests full admin-level seller management capability
