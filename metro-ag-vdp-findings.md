@@ -3,13 +3,13 @@
 **Date**: 2026-09-29
 **Scope**: Metro AG Vulnerability Disclosure Program (VDP)
 **Tester**: Authorized VDP participant
-**Status**: Phase 11 - CSP weaknesses + pre-production self-service portal exposure
+**Status**: Phase 12 - Source maps exposure + continued deep probing
 
 ---
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **30 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **31 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3102,6 +3102,82 @@ The web-components endpoint issues session cookies and has rate limiting, confir
 3. Remove `pk.betty-test.localhost` and other development references from production CSP
 4. Ensure pre-production Datadog environment is tagged as `pre-prod`, not `prod`
 5. Use separate Azure AD app registrations for pre-production with restricted permissions
+
+---
+
+## Finding 31: Source Maps Publicly Accessible Across Metro Shop Platform — Full Original Source Code Exposed
+
+**Severity**: Low
+**CVSS**: 3.7 (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: All metro shop domains (consegne.metro.it, horeca-dagitim.metro-tr.com, online.metro.rs, tienda.makro.es, dostavka-pp.metro.ua — in scope)
+**Type**: Information Disclosure (OWASP A05)
+
+### Description
+
+JavaScript source maps (`.js.map` files) containing the full original TypeScript source code (`sourcesContent` field populated) are publicly accessible on all metro shop domains. Six micro-frontend entry points and their source maps are served without authentication, totaling over 2.3MB of source map data that exposes the internal `platform-uidispatcher` architecture, Module Federation configuration, internal backoffice module names, and webpack runtime internals.
+
+### Evidence
+
+#### 31a. Source Maps Accessible Platform-Wide
+
+```
+GET /ordercapture/uidispatcher/static/app/scripts.js.map HTTP/2
+Host: consegne.metro.it
+
+200 OK (479,087 bytes)
+Content-Type: application/octet-stream
+X-Guploader-Uploadid: AP6rU83NKv...   ← Served from Google Cloud Storage
+```
+
+**Confirmed on all tested shop domains (identical 479,087-byte files):**
+- consegne.metro.it (Italy production)
+- horeca-dagitim.metro-tr.com (Turkey production)
+- online.metro.rs (Serbia production)
+- tienda.makro.es (Spain/Makro production)
+- dostavka-pp.metro.ua (Ukraine pre-production)
+
+#### 31b. Six Micro-Frontend Source Maps With Full Source Code
+
+| Module | Path | Size |
+|--------|------|------|
+| platform-uidispatcher | `/ordercapture/uidispatcher/static/app/scripts.js.map` | 479 KB |
+| betty_ordercapture_ui | `/ordercapture/ui/static/app/oc_ui.js.map` | 493 KB |
+| betty_explore_backofficeui | `/searchdiscover/backofficeui/static/app/sd_backoffice_ui.js.map` | 378 KB |
+| betty_navbar | `/ordermanagement/navbarui/mf/remoteEntry.js.map` | 345 KB |
+| ca_backoffice_ui | `/cia/backoffice-ca-ui/app/ca_backoffice_ui.js.map` | 324 KB |
+| cia_backoffice_inspiration | `/cia/backoffice-inspiration-ui/app/cia_backoffice_inspiration.js.map` | 324 KB |
+
+All source maps contain the `sourcesContent` field with 80-107 complete source files each.
+
+#### 31c. Internal Architecture Exposed
+
+The source maps reveal the Module Federation micro-frontend architecture:
+```json
+{
+  "name": "uidispatcher_api",
+  "remotes": [
+    {"alias": "ca_bo_ui", "name": "ca_backoffice_ui", "entry": "/cia/backoffice-ca-ui/app/ca_backoffice_ui.js"},
+    {"alias": "ci_bo_ui", "name": "cia_backoffice_inspiration", "entry": "/cia/backoffice-inspiration-ui/app/..."},
+    {"alias": "oc_ui", "name": "oc_ui", "entry": "/ordercapture/ui/static/app/oc_ui.js"},
+    {"alias": "explore_ui", "name": "cia_explore_ui", "entry": "/cia/explore-ui/app/cia_explore_ui.js"},
+    {"alias": "sd_bo_ui", "name": "sd_backoffice_ui", "entry": "/searchdiscover/backofficeui/static/app/..."}
+  ]
+}
+```
+
+This exposes internal backoffice UI names (`ca_backoffice_ui`, `sd_backoffice_ui`, `cia_backoffice_inspiration`) and the shared dependency graph.
+
+### Impact
+
+- **Source code reverse engineering**: Original TypeScript source code makes vulnerability discovery significantly easier
+- **Internal architecture mapping**: Module Federation config reveals the complete micro-frontend architecture including backoffice UIs
+- **Platform-wide scope**: Affects every metro shop domain across all countries
+
+### Recommendation
+
+1. Configure GCS/CDN to block serving `.map` files to external clients
+2. Remove `sourcesContent` from production source maps (use `nosources-source-map` webpack devtool option)
+3. If source maps are needed for error monitoring (Datadog/Sentry), upload them directly to the monitoring service instead of serving them publicly
 
 ---
 
