@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Comprehensive testing of 66 in-scope Metro AG assets identified **31 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
+Comprehensive testing of 66 in-scope Metro AG assets identified **33 reportable findings** across production and pre-production infrastructure. The highest-impact findings are:
 
 1. **IDAM OAuth 2.0 platform-wide misconfigurations** — implicit flow, password grant, and plain PKCE all enabled across ALL tested IDAM instances (idam.metrosystems.net, idam.metro.de, idam.metro.fr, idam.metro.it), violating RFC 9700; SAML signing key exposed in JWKS; internal Confluence URL leaked in error messages (Finding 24 — High, CVSS 7.4)
 2. **METRO Seller Office unauthenticated config endpoint exposes 21 internal microservice URLs** — all publicly accessible, with `service-aftersales-v2` running Laravel Debugbar in production, Ignition RCE vector routes defined, complete API route map including admin endpoints, Sanctum session cookies without auth, wildcard CORS with impersonation header whitelist, Sentry DSN, and multiple SDK keys (Finding 23 — Critical, CVSS 9.3)
@@ -3181,7 +3181,144 @@ This exposes internal backoffice UI names (`ca_backoffice_ui`, `sd_backoffice_ui
 
 ---
 
-## Next Steps (Phase 11)
+## Finding 32: GCS Production Bucket Directory Listing Enabled on images.metro-marketplace.eu
+
+**Severity**: Medium
+**CVSS**: 5.3 (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: images.metro-marketplace.eu (*.metro-marketplace.eu — in scope)
+**Type**: Cloud Misconfiguration — GCS Bucket Listing (OWASP A05)
+
+### Description
+
+The Google Cloud Storage bucket `service-file-images-bucket-prod` backing `images.metro-marketplace.eu` has public directory listing enabled. Any unauthenticated user can enumerate all objects in the production bucket, including brand logos and category images with their metadata (file sizes, ETags, modification timestamps). The bucket also has a wildcard CORS policy (`Access-Control-Allow-Origin: *`), allowing any website to make cross-origin requests to enumerate and download bucket contents.
+
+### Evidence
+
+#### 32a. Bucket Listing Returns Full Object Enumeration
+
+```
+GET / HTTP/2
+Host: images.metro-marketplace.eu
+
+200 OK
+Content-Type: application/xml; charset=UTF-8
+Access-Control-Allow-Origin: *
+X-GUploader-UploadID: AJjja9YnUUHsCQw...
+
+<ListBucketResult xmlns='http://doc.s3.amazonaws.com/2006-03-01'>
+  <Name>service-file-images-bucket-prod</Name>
+  <IsTruncated>true</IsTruncated>
+  <Contents>
+    <Key>brand_logo/001f5747-fff9-4c9e-aefc-0443dda56a68</Key>
+    <LastModified>2025-11-20T10:09:59.000Z</LastModified>
+    <ETag>"e510087a024a75e7242e8de6558ca636"</ETag>
+    <Size>10220</Size>
+  </Contents>
+  ... (1000 entries per page, paginated via NextMarker)
+```
+
+**First page alone contains 1,000 objects (103 MB) in two categories:**
+- `brand_logo/` — 358 files (seller brand logos with UUID names)
+- `category_image/` — 642 files (product category images)
+
+The listing is truncated (`IsTruncated: true`), indicating thousands more objects beyond the first page.
+
+#### 32b. Production Bucket Name and Infrastructure Disclosed
+
+- Bucket name: `service-file-images-bucket-prod`
+- Served from Google Cloud Storage UploadServer
+- Object naming convention: `{type}/{UUID}` — predictable structure
+
+#### 32c. Wildcard CORS Enables Cross-Origin Enumeration
+
+```
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: DNT, Date, User-Agent, X-Requested-With,
+  If-Modified-Since, Cache-Control, Content-Type, Content-Length, Range,
+  Origin, Authorization, Server, Transfer-Encoding, X-GUploader-UploadID,
+  X-Google-Trace, Range, Authorization, ...
+```
+
+Any website can use JavaScript to enumerate the bucket contents and download files cross-origin, enabling automated scraping of all marketplace brand assets.
+
+### Impact
+
+- **Complete object enumeration**: All files in the production bucket can be listed and downloaded
+- **Metadata exposure**: File modification dates, sizes, and ETags reveal upload patterns and content changes
+- **Infrastructure disclosure**: Production bucket name and GCS configuration exposed
+- **Cross-origin scraping**: Wildcard CORS allows any website to automate bucket enumeration via JavaScript
+
+### Recommendation
+
+1. Disable public listing on the GCS bucket — set `allUsers` to `objectViewer` only (not `legacyBucketReader`)
+2. Replace wildcard CORS with an explicit allowlist of metro domains
+3. Consider using signed URLs or CDN-based access control for image serving
+
+---
+
+## Finding 33: Seller Gateway Complete OpenAPI Specification Served Unauthenticated
+
+**Severity**: Low
+**CVSS**: 3.7 (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N)
+**Asset**: service-seller-gateway.prod.de.metro-marketplace.cloud (*.metro-marketplace.cloud — in scope)
+**Type**: Information Disclosure — API Documentation Exposure (OWASP A05)
+
+### Description
+
+The seller gateway service at `service-seller-gateway.prod.de.metro-marketplace.cloud` serves its complete OpenAPI 3.0 specification via Swagger UI at `/api/v1/api-doc` and as raw JSON at `/api/v1/api-doc.json` without authentication. The specification documents 21+ API endpoints across two backend services (`app-order-management` and `service-seller-account-health`), complete request/response schemas, and the JWT Bearer authentication scheme.
+
+### Evidence
+
+#### 33a. Swagger UI Publicly Accessible
+
+```
+GET / HTTP/2
+Host: service-seller-gateway.prod.de.metro-marketplace.cloud
+
+302 Found
+Location: .../api/v1/api-doc    ← Redirects to Swagger UI
+
+GET /api/v1/api-doc HTTP/2
+200 OK
+Content-Type: text/html
+<title>service-seller-gateway</title>
+<script id="swagger-data" type="application/json">{"spec":{"openapi":"3.0.0",...}}
+```
+
+#### 33b. Complete API Surface Documented
+
+**app-order-management endpoints:**
+- `POST /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/return-label`
+- `DELETE /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/documents/{documentId}`
+- `PUT /api/seller/proxy/app-order-management/v1/order-lines/{orderLineId}/return-trackings`
+- `GET /api/seller/proxy/app-order-management/v1/delivery-carriers`
+
+**service-seller-account-health (7 KPI types with list/detail/export):**
+- Contact Defect Ratio, Invoice Defect Ratio, On-Time Delivery, Order Defect, Pre-Fulfillment Cancellation, Return Defect, Seller Response, Valid Tracking
+
+#### 33c. Health Endpoint Accessible Without Auth
+
+```
+GET /api/v1/auth/app-check/health HTTP/2
+200 OK
+service-seller-gateway is ready.
+```
+
+### Impact
+
+- **API surface mapping**: Complete documentation of all seller gateway endpoints enables targeted attacks against authenticated endpoints
+- **Data schema exposure**: Full request/response schemas including order numbers, tracking IDs, carrier names, and seller health KPIs
+- **Internal service names**: Backend services (`service-seller-account-health`, `app-order-management`) revealed
+
+### Recommendation
+
+1. Restrict Swagger UI and API documentation endpoints to authenticated users only
+2. Disable NelmioApiDocBundle default endpoint exposure in production
+3. Use API gateway rules to block unauthenticated access to `/api/v1/api-doc*`
+
+---
+
+## Next Steps (Phase 12)
 
 1. **Authenticated testing** — obtain valid test credentials to test IDOR, privilege escalation, and business logic flaws on the betty platform using the disclosed authentication endpoints
 2. **Employee entitlement escalation** — using disclosed entitlement codes (lPM, lTM, fISTC) to test privilege escalation once authenticated
