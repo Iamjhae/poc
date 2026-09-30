@@ -2168,6 +2168,43 @@ The PIM spec reveals `SecurityToken` schema with `access_token`, `refresh_token`
 
 **Critical leaks:** The PIM self-check reveals MongoDB via Doctrine ODM and PubSub topic names. The inventory self-check reveals Redis, Doctrine ORM, Elasticsearch, and PubSub subscription names (`org_offer_status_pausing`, `org_offer_status_unpausing`). Two services show PubSub connection failures in production.
 
+**Most severe self-check leak — service-anonymous-emails:**
+```json
+{
+  "status": "FAIL",
+  "output": [
+    "[ENVIRONMENT REQUIRED VARIABLES]: Variable \"APP_SECRET\" has not been defined. Variable \"VAR_DUMPER_SERVER\" has not been defined.",
+    "[PUB_SUB]: Connection error: { \"error\": { \"code\": 403, \"message\": \"User not authorized\", \"status\": \"PERMISSION_DENIED\", \"details\": [{ \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\", \"reason\": \"IAM_PERMISSION_DENIED\", \"metadata\": { \"resource\": \"projects/metro-markets-prod\", \"permission\": \"pubsub.topics.list\" }}]}}",
+    "[SERVICES]: Service \"service-accounting.prod.de.metro-marketplace.cloud\" is unavailable."
+  ]
+}
+```
+This leaks:
+- **Production GCP project name**: `projects/metro-markets-prod`
+- **GCP IAM troubleshooter URL** with base64-encoded error ID linking to the IAM admin console
+- **Missing `APP_SECRET`** — a Symfony security-critical variable
+- **`VAR_DUMPER_SERVER`** — Symfony debug variable exposed in production
+- **Previously unknown internal service**: `service-accounting.prod.de.metro-marketplace.cloud` (22nd service, not in the config endpoint)
+
+#### 10b. Pre-Production Environment — Same Vulnerabilities + Additional Exposure
+
+The pre-prod seller office at `web-app-seller.pp-de.metro-marketplace.cloud` also exposes `/api/v1/config` without authentication, leaking 21 pre-prod internal service URLs (`*.pp-de.metro-marketplace.cloud`):
+
+- All pre-prod services share the SAME Sentry DSN as production (same project receives both environments' errors)
+- Different ConfigCat SDK key: `DVPXCI0if81SA9_CiLstKA/9H_u2-xmXUatFJAGiah3Wg`
+- Different METRO seller ID: `b4b309e0-9f53-4c9b-b639-3913b7131996`
+- **Employee backoffice URL**: `web-app-employee.pp-de.metro-marketplace.cloud`
+- **Staging CDN bucket**: `staging-cdn-bucket.pp-de.metro-marketplace.cloud` — 403 response leaks GCP service account `cdn-lb-sa@metro-markets-staging.iam.gserviceaccount.com` and GCP project `metro-markets-staging`
+- **Storyblok CMS integration**: CSP `frame-ancestors 'self' https://app.storyblok.com`
+- Pre-prod PIM self-check leaks same MongoDB + PubSub failures as production
+- Pre-prod seller-gateway has same wildcard CORS + unauthenticated Swagger UI
+
+**Combined GCP project discovery:**
+| Environment | GCP Project | Source |
+|-------------|-------------|--------|
+| Production | `metro-markets-prod` | anonymous-emails self-check PubSub error |
+| Staging | `metro-markets-staging` | staging CDN bucket 403 error |
+
 #### 11. Permissive CSP
 
 ```
